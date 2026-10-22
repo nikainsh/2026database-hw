@@ -27,14 +27,12 @@ RC QueryEngine::run_plan(PhysicalOperator &plan, const SqlResult &input, ResultW
   }
 
   if (local.is_query) {
-    RC header_rc = writer.write_header(local);
-    if (OB_FAIL(header_rc)) {
-      return header_rc;
-    }
+    rc = writer.write_header(local);
   }
 
   int64_t rows = 0;
-  while (true) {
+  // 表头输出失败也走统一收尾，不再跳过已打开计划的 close。
+  while (OB_SUCC(rc)) {
     Tuple *tuple = nullptr;
     rc         = plan.next(tuple);
     if (rc == RC::RECORD_EOF) {
@@ -60,7 +58,11 @@ RC QueryEngine::run_plan(PhysicalOperator &plan, const SqlResult &input, ResultW
   local.code           = rc;
   local.rows           = rows;
   local.affected_rows  = plan.affected_rows();
-  writer.write_result(local);
+  // 输出最终概要失败不能被当作执行成功；已有错误则优先保留。
+  RC result_rc = writer.write_result(local);
+  if (OB_SUCC(rc)) {
+    rc = result_rc;
+  }
   return rc;
 }
 
