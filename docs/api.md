@@ -139,35 +139,28 @@ const char *data = handle.const_data();
 handle.reset();
 ```
 
-### 3.4 兼容模式（默认 `get_page`）
-
-```cpp
-PageHandle handle;
-pool->get_page(page, handle);   // PageAccess::NONE
-```
-
-- 只 pin，不加页锁；
-- 旧代码可以直接使用；
-- 多线程下如果多个线程读写同一页，不安全；
-- `mark_dirty()` 在 NONE 下允许（兼容旧代码）。
-
-### 3.5 `PageAccess`
+### 3.4 `PageAccess`
 
 ```cpp
 enum class PageAccess
 {
-  NONE,   // pin only，兼容模式
   READ,   // shared page latch
   WRITE,  // exclusive page latch
 };
 ```
 
-显式指定：
+页访问必须显式指定：
 
 ```cpp
+pool->get_page_read(page, handle);    // 推荐写法
+pool->get_page_write(page, handle);   // 推荐写法
+
+// 也可以直接传 PageAccess
 pool->get_page(page, handle, PageAccess::READ);
 pool->get_page(page, handle, PageAccess::WRITE);
 ```
+
+不再保留“只 pin、不加页锁”的兼容模式。
 
 ---
 
@@ -183,7 +176,7 @@ handle.frame_id();    // FrameId
 handle.access();      // PageAccess
 handle.value();       // char*（可写）
 handle.const_data();  // const char*（只读）
-handle.mark_dirty();  // 仅 WRITE / NONE
+handle.mark_dirty();  // 仅 WRITE
 handle.reset();       // 释放页锁 + unpin
 ```
 
@@ -242,8 +235,8 @@ pool->get_page_write(page, b);   // deadlock
 a.reset();
 pool->get_page_write(page, b);
 
-// 正确 2：只需要 pin 时用兼容模式
-pool->get_page(page, b);         // NONE，不加页锁
+// 正确 2：重构调用，避免同一线程嵌套获取同一页
+// （PageAccess 只有 READ/WRITE，不再提供无锁 pin）
 ```
 
 ### 6.3 关闭前释放 handle
@@ -345,6 +338,11 @@ pool->prefetch_range(start_page, count);
 - 不会返回 `PageHandle`；
 - 会阻塞到 I/O 完成；
 - 适合扫描器在顺序读取前提前调用。
+
+已接入：
+
+- `RecordScanner::next`：每跨 4 页预取后续最多 4 页；
+- `BplusTreeScanner::move_to_next_leaf`：预取 `next_leaf`。
 
 后续可替换为后台预取线程/队列。
 
