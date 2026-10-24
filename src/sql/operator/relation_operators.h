@@ -62,6 +62,9 @@ private:
   Tuple joined_;
   bool  left_ready_ = false;
   bool  left_eof_   = false;
+  // 右侧按左行延迟打开；不能关闭尚未打开或本轮已关闭的子算子。
+  bool  left_opened_  = false;
+  bool  right_opened_ = false;
 };
 
 /// 投影算子：按 select 列表求值，输出一行计算结果

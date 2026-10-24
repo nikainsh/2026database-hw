@@ -60,6 +60,9 @@ RC FilterPhysicalOperator::next(Tuple *&tuple)
 
 RC NestedLoopJoinOperator::open()
 {
+  if (left_opened_ || right_opened_) {
+    return RC::INVALID_ARGUMENT;  // 先 close，再重新 open，避免丢失活动输入。
+  }
   if (children_.size() != 2) {
     LOG_ERROR("nested loop join needs exactly 2 children, got %d", (int)children_.size());
     return RC::INTERNAL;
@@ -67,25 +70,38 @@ RC NestedLoopJoinOperator::open()
 
   left_ready_ = false;
   left_eof_   = false;
-  return children_[0]->open();
+  left_tuple_.clear();
+  joined_.clear();
+  RC rc = children_[0]->open();
+  left_opened_ = OB_SUCC(rc);
+  return rc;
 }
 
 RC NestedLoopJoinOperator::close()
 {
   RC rc = RC::SUCCESS;
-  for (auto &child : children_) {
-    RC one = child->close();
-    if (OB_FAIL(one)) {
-      rc = one;
-    }
+  // 逆序收尾。即使右侧关闭报错，也继续关闭左侧并保留最先的错误。
+  if (right_opened_) {
+    rc = children_[1]->close();
+    right_opened_ = false;
+  }
+  if (left_opened_) {
+    RC one = children_[0]->close();
+    left_opened_ = false;
+    if (OB_SUCC(rc)) rc = one;
   }
   left_ready_ = false;
   left_eof_   = false;
+  left_tuple_.clear();
+  joined_.clear();
   return rc;
 }
 
 RC NestedLoopJoinOperator::next(Tuple *&tuple)
 {
+  if (!left_opened_) {
+    return RC::INTERNAL;
+  }
   while (true) {
     if (left_eof_) {
       return RC::RECORD_EOF;
@@ -107,15 +123,22 @@ RC NestedLoopJoinOperator::next(Tuple *&tuple)
 
       rc = children_[1]->open();
       if (OB_FAIL(rc)) {
+        left_eof_ = true;  // 错误后不再访问未成功打开的右侧，等待 close。
         return rc;
       }
+      right_opened_ = true;
     }
 
     Tuple *right = nullptr;
     RC    rc   = children_[1]->next(right);
     if (rc == RC::RECORD_EOF) {
-      children_[1]->close();
+      rc = children_[1]->close();
+      right_opened_ = false;
       left_ready_ = false;
+      if (OB_FAIL(rc)) {
+        left_eof_ = true;
+        return rc;
+      }
       continue;
     }
     if (OB_FAIL(rc)) {
