@@ -1,0 +1,294 @@
+/* database26 buffer manager - page-level write-ahead log */
+#include "storage/buffer/page_wal.h"
+
+#include <cstring>
+#include <filesystem>
+#include <vector>
+
+#include "storage/buffer/checksum.h"
+#include "storage/buffer/page.h"
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
+namespace
+{
+constexpr uint32_t WAL_HEADER_MAGIC = 0x4D57414Cu;  // 'MWAL'
+constexpr uint32_t WAL_RECORD_MAGIC = 0x4D575243u;  // 'MWRC'
+constexpr uint16_t WAL_VERSION      = 1;
+
+#pragma pack(push, 1)
+struct WALHeader
+{
+  uint32_t magic       = WAL_HEADER_MAGIC;
+  uint16_t version     = WAL_VERSION;
+  uint16_t header_size = 0;
+  uint32_t page_size   = BP_PAGE_SIZE;
+  uint32_t reserved    = 0;
+};
+
+struct WALRecordHeader
+{
+  uint32_t magic     = WAL_RECORD_MAGIC;
+  uint32_t size      = BP_PAGE_SIZE;
+  uint32_t crc       = 0;
+  uint32_t reserved  = 0;
+  uint64_t lsn       = 0;
+  int32_t  page_num  = INVALID_PAGE_NUM;
+  int32_t  reserved2 = 0;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(WALHeader) == 16, "unexpected WAL header layout");
+static_assert(sizeof(WALRecordHeader) == 32, "unexpected WAL record header layout");
+
+int file_seek(FILE *fp, int64_t offset)
+{
+#ifdef _WIN32
+  return _fseeki64(fp, offset, SEEK_SET);
+#else
+  return fseeko(fp, static_cast<off_t>(offset), SEEK_SET);
+#endif
+}
+
+int file_seek_end(FILE *fp)
+{
+#ifdef _WIN32
+  return _fseeki64(fp, 0, SEEK_END);
+#else
+  return fseeko(fp, 0, SEEK_END);
+#endif
+}
+
+RC sync_file(FILE *fp)
+{
+  if (fflush(fp) != 0) {
+    return RC::IOERR_SYNC;
+  }
+#ifdef _WIN32
+  if (_commit(_fileno(fp)) != 0) {
+    return RC::IOERR_SYNC;
+  }
+#else
+  if (fsync(fileno(fp)) != 0) {
+    return RC::IOERR_SYNC;
+  }
+#endif
+  return RC::SUCCESS;
+}
+}  // namespace
+
+PageWAL::PageWAL(std::string path) : path_(std::move(path)) {}
+
+PageWAL::~PageWAL() { close(); }
+
+RC PageWAL::open(bool create_if_missing)
+{
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (file_ != nullptr) {
+    return RC::SUCCESS;
+  }
+
+  const bool exists = std::filesystem::exists(path_);
+  if (!exists && !create_if_missing) {
+    return RC::FILE_NOT_EXIST;
+  }
+
+  file_ = fopen(path_.c_str(), exists ? "r+b" : "w+b");
+  if (file_ == nullptr) {
+    return RC::FILE_OPEN;
+  }
+
+  std::error_code ec;
+  const auto      size = exists ? std::filesystem::file_size(path_, ec) : 0;
+  if (!exists || (!ec && size == 0)) {
+    RC rc = write_header_locked();
+    if (OB_FAIL(rc)) {
+      fclose(file_);
+      file_ = nullptr;
+      return rc;
+    }
+    return RC::SUCCESS;
+  }
+
+  RC rc = read_header_locked();
+  if (OB_FAIL(rc)) {
+    fclose(file_);
+    file_ = nullptr;
+    return rc;
+  }
+
+  if (file_seek(file_, 0) != 0) {
+    fclose(file_);
+    file_ = nullptr;
+    return RC::IOERR_SEEK;
+  }
+  return RC::SUCCESS;
+}
+
+RC PageWAL::close()
+{
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (file_ != nullptr) {
+    fclose(file_);
+    file_ = nullptr;
+  }
+  return RC::SUCCESS;
+}
+
+RC PageWAL::write_header_locked()
+{
+  WALHeader header;
+  header.header_size = sizeof(WALHeader);
+  if (file_seek(file_, 0) != 0) {
+    return RC::IOERR_SEEK;
+  }
+  if (fwrite(&header, 1, sizeof(header), file_) != sizeof(header)) {
+    return RC::IOERR_WRITE;
+  }
+  return sync_file(file_);
+}
+
+RC PageWAL::read_header_locked()
+{
+  WALHeader header;
+  if (file_seek(file_, 0) != 0) {
+    return RC::IOERR_SEEK;
+  }
+  const size_t got = fread(&header, 1, sizeof(header), file_);
+  if (got != sizeof(header)) {
+    return RC::BUFFERPOOL_WAL_ERROR;
+  }
+  if (header.magic != WAL_HEADER_MAGIC || header.version != WAL_VERSION ||
+      header.header_size != sizeof(WALHeader) || header.page_size != BP_PAGE_SIZE) {
+    return RC::BUFFERPOOL_WAL_ERROR;
+  }
+  return RC::SUCCESS;
+}
+
+RC PageWAL::seek_locked(int64_t offset)
+{
+  if (file_ == nullptr) {
+    return RC::FILE_NOT_OPENED;
+  }
+  if (file_seek(file_, offset) != 0) {
+    return RC::IOERR_SEEK;
+  }
+  return RC::SUCCESS;
+}
+
+RC PageWAL::sync_locked()
+{
+  if (file_ == nullptr) {
+    return RC::FILE_NOT_OPENED;
+  }
+  return sync_file(file_);
+}
+
+RC PageWAL::replay(const std::function<RC(PageNum, const char *)> &writer)
+{
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (file_ == nullptr) {
+    return RC::FILE_NOT_OPENED;
+  }
+  if (writer == nullptr) {
+    return RC::INVALID_ARGUMENT;
+  }
+
+  RC rc = read_header_locked();
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+
+  std::vector<char> record(sizeof(WALRecordHeader) + BP_PAGE_SIZE);
+  while (true) {
+    WALRecordHeader header;
+    const size_t header_got = fread(&header, 1, sizeof(header), file_);
+    if (header_got == 0) {
+      break;  // clean EOF
+    }
+    if (header_got != sizeof(header)) {
+      break;  // torn tail
+    }
+    if (header.magic != WAL_RECORD_MAGIC || header.size != BP_PAGE_SIZE ||
+        header.page_num < 0 || header.page_num > (1 << 30)) {
+      break;
+    }
+
+    const size_t data_got = fread(record.data() + sizeof(header), 1, BP_PAGE_SIZE, file_);
+    if (data_got != BP_PAGE_SIZE) {
+      break;  // torn tail
+    }
+
+    memcpy(record.data(), &header, sizeof(header));
+    WALRecordHeader *stored = reinterpret_cast<WALRecordHeader *>(record.data());
+    const uint32_t   expect_crc = stored->crc;
+    stored->crc = 0;
+    const uint32_t actual_crc = crc32(record.data(), record.size());
+    if (actual_crc != expect_crc) {
+      break;  // corrupt tail
+    }
+
+    rc = writer(static_cast<PageNum>(header.page_num), record.data() + sizeof(header));
+    if (OB_FAIL(rc)) {
+      return rc;
+    }
+    if (header.lsn >= last_lsn_) {
+      last_lsn_ = header.lsn + 1;
+    }
+  }
+
+  return RC::SUCCESS;
+}
+
+RC PageWAL::append_and_sync(PageNum page_num, const char *data)
+{
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (file_ == nullptr) {
+    return RC::FILE_NOT_OPENED;
+  }
+  if (data == nullptr || page_num < 0) {
+    return RC::INVALID_ARGUMENT;
+  }
+
+  WALRecordHeader header;
+  header.lsn      = last_lsn_;
+  header.page_num = page_num;
+  header.crc      = 0;
+
+  std::vector<char> record(sizeof(header) + BP_PAGE_SIZE);
+  memcpy(record.data(), &header, sizeof(header));
+  memcpy(record.data() + sizeof(header), data, BP_PAGE_SIZE);
+  header.crc = crc32(record.data(), record.size());
+  memcpy(record.data(), &header, sizeof(header));
+
+  if (file_seek_end(file_) != 0) {
+    return RC::IOERR_SEEK;
+  }
+  if (fwrite(record.data(), 1, record.size(), file_) != record.size()) {
+    return RC::IOERR_WRITE;
+  }
+  RC rc = sync_file(file_);
+  if (OB_SUCC(rc)) {
+    ++last_lsn_;
+  }
+  return rc;
+}
+
+RC PageWAL::checkpoint()
+{
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (file_ == nullptr) {
+    return RC::FILE_NOT_OPENED;
+  }
+
+  fclose(file_);
+  file_ = fopen(path_.c_str(), "w+b");
+  if (file_ == nullptr) {
+    return RC::FILE_OPEN;
+  }
+  return write_header_locked();
+}

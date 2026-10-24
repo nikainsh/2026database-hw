@@ -1,12 +1,27 @@
-/* minidb - a minimal relational DBMS, architecture follows oceanbase/miniob */
-
+/* database26 buffer manager - thread-safe page cache with WAL */
 #include "storage/buffer/disk_buffer_pool.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstring>
+#include <filesystem>
+#include <limits>
+#include <system_error>
 
 #include "common/log.h"
+#include "storage/buffer/checksum.h"
 
-static int file_seek(FILE *fp, int64_t offset)
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
+namespace
+{
+constexpr int kMaxFramesPerFile = 1 << 20;
+
+int file_seek(FILE *fp, int64_t offset)
 {
 #ifdef _WIN32
   return _fseeki64(fp, offset, SEEK_SET);
@@ -15,6 +30,53 @@ static int file_seek(FILE *fp, int64_t offset)
 #endif
 }
 
+RC sync_file(FILE *fp)
+{
+  if (fp == nullptr) {
+    return RC::FILE_NOT_OPENED;
+  }
+  if (fflush(fp) != 0) {
+    return RC::IOERR_SYNC;
+  }
+#ifdef _WIN32
+  if (_commit(_fileno(fp)) != 0) {
+    return RC::IOERR_SYNC;
+  }
+#else
+  if (fsync(fileno(fp)) != 0) {
+    return RC::IOERR_SYNC;
+  }
+#endif
+  return RC::SUCCESS;
+}
+
+void encode_header(const DiskFileHeader &in, char *page)
+{
+  memset(page, 0, BP_PAGE_SIZE);
+  DiskFileHeader header = in;
+  header.header_size     = sizeof(DiskFileHeader);
+  header.header_crc      = 0;
+  memcpy(page, &header, sizeof(header));
+  header.header_crc = crc32(page, offsetof(DiskFileHeader, header_crc));
+  memcpy(page, &header, sizeof(header));
+}
+
+RC decode_header(const char *page, DiskFileHeader *out)
+{
+  DiskFileHeader header;
+  memcpy(&header, page, sizeof(header));
+  if (header.header_size != sizeof(DiskFileHeader)) {
+    return RC::BUFFERPOOL_CORRUPTED;
+  }
+  const uint32_t expect = crc32(page, offsetof(DiskFileHeader, header_crc));
+  if (expect != header.header_crc) {
+    return RC::BUFFERPOOL_CORRUPTED;
+  }
+  *out = header;
+  return RC::SUCCESS;
+}
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // PageHandle
 // ---------------------------------------------------------------------------
@@ -22,10 +84,17 @@ static int file_seek(FILE *fp, int64_t offset)
 void PageHandle::reset()
 {
   if (pool_ != nullptr) {
+    if (access_ == PageAccess::READ) {
+      pool_->unlock_frame_shared(frame_id_);
+    } else if (access_ == PageAccess::WRITE) {
+      pool_->unlock_frame_exclusive(frame_id_);
+    }
     pool_->unpin_page(frame_id_);
+    pool_->release_handle();
     pool_     = nullptr;
     frame_id_ = INVALID_FRAME_ID;
     page_id_  = INVALID_PAGE_NUM;
+    access_   = PageAccess::NONE;
   }
 }
 
@@ -38,6 +107,9 @@ char *PageHandle::value() const
 RC PageHandle::mark_dirty()
 {
   ASSERT(pool_ != nullptr, "the page handle is not valid");
+  if (access_ == PageAccess::READ) {
+    return RC::BUFFERPOOL_READ_ONLY_HANDLE;
+  }
   return pool_->mark_page_dirty(frame_id_);
 }
 
@@ -45,10 +117,30 @@ RC PageHandle::mark_dirty()
 // DiskBufferPool
 // ---------------------------------------------------------------------------
 
-DiskBufferPool::~DiskBufferPool() { close(); }
+DiskBufferPool::DiskBufferPool() = default;
+
+DiskBufferPool::~DiskBufferPool()
+{
+  RC rc = close();
+  if (OB_FAIL(rc)) {
+    LOG_WARN("buffer pool close on destruction failed. file=%s, rc=%s", file_name_.c_str(), strrc(rc));
+  }
+}
 
 RC DiskBufferPool::create_file(const std::string &path)
 {
+  if (std::filesystem::exists(path)) {
+    return RC::FILE_EXIST;
+  }
+
+  /// A newly created data file must not inherit a stale WAL from a previous
+  /// incarnation of the same path.
+  std::error_code ec;
+  const std::string wal_path = path + ".wal";
+  if (std::filesystem::exists(wal_path, ec)) {
+    std::filesystem::remove(wal_path, ec);
+  }
+
   FILE *fp = fopen(path.c_str(), "wb");
   if (fp == nullptr) {
     LOG_ERROR("failed to create file. path=%s", path.c_str());
@@ -56,95 +148,271 @@ RC DiskBufferPool::create_file(const std::string &path)
   }
 
   DiskFileHeader header;
-  header.page_count = 1;
+  header.header_size     = sizeof(DiskFileHeader);
+  header.page_count      = 1;
   header.first_free_page = INVALID_PAGE_NUM;
+  header.free_page_count = 0;
+  header.checkpoint_lsn  = 0;
 
   char page[BP_PAGE_SIZE];
-  memset(page, 0, sizeof(page));
-  memcpy(page, &header, sizeof(header));
+  encode_header(header, page);
 
   if (fwrite(page, 1, sizeof(page), fp) != sizeof(page)) {
     fclose(fp);
     return RC::IOERR_WRITE;
   }
+  RC rc = sync_file(fp);
   fclose(fp);
-  return RC::SUCCESS;
+  return rc;
 }
 
-RC DiskBufferPool::open(const std::string &path, ReadWriteMode mode, int frame_limit)
+RC DiskBufferPool::open(const std::string &path, ReadWriteMode mode, int frame_limit, bool enable_wal)
 {
-  ASSERT(handle_ == nullptr, "buffer pool has been opened. file=%s", path.c_str());
+  if (frame_limit <= 0 || frame_limit > kMaxFramesPerFile) {
+    return RC::BUFFERPOOL_INVALID_FRAME_LIMIT;
+  }
+  if (handle_ != nullptr) {
+    return RC::BUFFERPOOL_OPEN;
+  }
+
+  file_name_       = path;
+  wal_path_        = path + ".wal";
+  mode_            = mode;
+  enable_wal_      = enable_wal && mode == ReadWriteMode::READ_WRITE;
+  header_          = DiskFileHeader{};
+  header_dirty_    = false;
+  closed_          = false;
+  closing_         = false;
+  active_handles_.store(0, std::memory_order_relaxed);
+  free_pages_.clear();
+  page_table_.clear();
+  frames_.reset();
+  frame_limit_ = 0;
+  replacement_ = LruKPolicy(2);
 
   const char *fmode = mode == ReadWriteMode::READ_WRITE ? "r+b" : "rb";
   handle_           = fopen(path.c_str(), fmode);
   if (handle_ == nullptr) {
+    closed_ = true;
     LOG_ERROR("failed to open file. path=%s, mode=%s", path.c_str(), fmode);
     return RC::FILE_OPEN;
   }
 
-  file_name_ = path;
-  mode_      = mode;
+  if (mode_ == ReadWriteMode::READ_ONLY) {
+    std::error_code ec;
+    const auto      size = std::filesystem::file_size(wal_path_, ec);
+    if (!ec && size > sizeof(uint32_t) * 4) {
+      LOG_ERROR("read-only open requires WAL recovery first. file=%s", path.c_str());
+      fclose(handle_);
+      handle_ = nullptr;
+      closed_ = true;
+      return RC::BUFFERPOOL_WAL_ERROR;
+    }
+  }
+
+  if (enable_wal_) {
+    wal_ = std::make_unique<PageWAL>(wal_path_);
+    RC rc = wal_->open(true);
+    if (OB_FAIL(rc)) {
+      LOG_ERROR("failed to open WAL. file=%s, rc=%s", wal_path_.c_str(), strrc(rc));
+      fclose(handle_);
+      handle_ = nullptr;
+      closed_ = true;
+      wal_.reset();
+      return rc;
+    }
+
+    rc = wal_->replay([this](PageNum page_num, const char *data) {
+      return write_page_raw(page_num, data);
+    });
+    if (OB_FAIL(rc)) {
+      LOG_ERROR("failed to replay WAL. file=%s, rc=%s", wal_path_.c_str(), strrc(rc));
+      fclose(handle_);
+      handle_ = nullptr;
+      closed_ = true;
+      wal_.reset();
+      return rc;
+    }
+
+    /// Recovery is not complete until replayed pages are durable.
+    rc = sync_data_file();
+    if (OB_FAIL(rc)) {
+      fclose(handle_);
+      handle_ = nullptr;
+      closed_ = true;
+      wal_.reset();
+      return rc;
+    }
+    rc = wal_->checkpoint();
+    if (OB_FAIL(rc)) {
+      fclose(handle_);
+      handle_ = nullptr;
+      closed_ = true;
+      wal_.reset();
+      return rc;
+    }
+  }
 
   RC rc = read_header();
   if (OB_FAIL(rc)) {
     fclose(handle_);
     handle_ = nullptr;
+    closed_ = true;
+    wal_.reset();
     return rc;
   }
 
-  frames_.clear();
-  frames_.reserve(frame_limit);
-  for (FrameId i = 0; i < frame_limit; ++i) {
-    frames_.emplace_back(i);
-    frames_.back().set_owner(this);
+  rc = validate_free_list();
+  if (OB_FAIL(rc)) {
+    fclose(handle_);
+    handle_ = nullptr;
+    closed_ = true;
+    wal_.reset();
+    return rc;
   }
-  page_table_.clear();
-  clock_hand_ = 0;
 
+  frames_ = std::make_unique<Frame[]>(frame_limit);
+  for (int i = 0; i < frame_limit; ++i) {
+    frames_[i].init(static_cast<FrameId>(i));
+    frames_[i].set_owner(this);
+  }
+  frame_limit_ = frame_limit;
+  page_table_.reserve(static_cast<size_t>(frame_limit));
+
+  closed_ = false;
   return RC::SUCCESS;
+}
+
+RC DiskBufferPool::close()
+{
+  {
+    std::lock_guard<std::mutex> guard(meta_mutex_);
+    if (closed_ && handle_ == nullptr) {
+      return RC::SUCCESS;
+    }
+    if (active_handles_.load(std::memory_order_relaxed) > 0) {
+      stats_.handle_busy.fetch_add(1, std::memory_order_relaxed);
+      return RC::BUFFERPOOL_HANDLE_BUSY;
+    }
+    closing_ = true;
+  }
+
+  RC rc = flush_all_buffers();
+
+  {
+    std::lock_guard<std::mutex> guard(meta_mutex_);
+    if (wal_) {
+      wal_->close();
+      wal_.reset();
+    }
+    if (handle_ != nullptr) {
+      fclose(handle_);
+      handle_ = nullptr;
+    }
+    page_table_.clear();
+    free_pages_.clear();
+    frames_.reset();
+    closed_      = true;
+    closing_     = false;
+    header_dirty_ = false;
+  }
+  return rc;
+}
+
+PageNum DiskBufferPool::page_count() const
+{
+  std::lock_guard<std::mutex> guard(meta_mutex_);
+  return header_.page_count;
+}
+
+int32_t DiskBufferPool::free_page_count() const
+{
+  std::lock_guard<std::mutex> guard(meta_mutex_);
+  return header_.free_page_count;
+}
+
+bool DiskBufferPool::is_open() const
+{
+  std::lock_guard<std::mutex> guard(meta_mutex_);
+  return !closed_ && !closing_ && handle_ != nullptr;
 }
 
 RC DiskBufferPool::read_header()
 {
   char page[BP_PAGE_SIZE];
-  RC   rc = read_page(BP_HEADER_PAGE, page);
+  RC   rc = read_page_raw(BP_HEADER_PAGE, page);
   if (OB_FAIL(rc)) {
     return rc;
   }
-
-  DiskFileHeader header;
-  memcpy(&header, page, sizeof(header));
-
-  if (header.magic != BP_FILE_MAGIC) {
-    LOG_ERROR("invalid file magic. file=%s", file_name_.c_str());
-    return RC::IOERR_READ;
+  rc = decode_header(page, &header_);
+  if (OB_FAIL(rc)) {
+    stats_.corrupted.fetch_add(1, std::memory_order_relaxed);
+    return rc;
   }
-  if (header.page_size != BP_PAGE_SIZE) {
-    LOG_ERROR("page size mismatch. file=%s, page_size=%d, expect=%d",
-              file_name_.c_str(), header.page_size, BP_PAGE_SIZE);
-    return RC::IOERR_READ;
-  }
-
-  header_       = header;
   header_dirty_ = false;
+  return validate_header();
+}
+
+RC DiskBufferPool::write_header_locked()
+{
+  char page[BP_PAGE_SIZE];
+  encode_header(header_, page);
+  RC rc = write_page_with_wal(BP_HEADER_PAGE, page);
+  if (OB_SUCC(rc)) {
+    header_dirty_ = false;
+  }
+  return rc;
+}
+
+RC DiskBufferPool::validate_header() const
+{
+  if (header_.magic != BP_FILE_MAGIC || header_.version != BP_FORMAT_VERSION) {
+    return RC::BUFFERPOOL_CORRUPTED;
+  }
+  if (header_.header_size != sizeof(DiskFileHeader) || header_.page_size != BP_PAGE_SIZE) {
+    return RC::BUFFERPOOL_CORRUPTED;
+  }
+  if (header_.page_count < 1 || header_.free_page_count < 0 ||
+      header_.free_page_count >= header_.page_count) {
+    return RC::BUFFERPOOL_CORRUPTED;
+  }
+  if (header_.first_free_page != INVALID_PAGE_NUM &&
+      (header_.first_free_page <= BP_HEADER_PAGE || header_.first_free_page >= header_.page_count)) {
+    return RC::BUFFERPOOL_CORRUPTED;
+  }
   return RC::SUCCESS;
 }
 
-RC DiskBufferPool::write_header()
+RC DiskBufferPool::validate_free_list()
 {
-  if (mode_ == ReadWriteMode::READ_ONLY) {
-    return RC::SUCCESS;
+  free_pages_.clear();
+  PageNum current = header_.first_free_page;
+  int     guard   = 0;
+  char    raw[BP_PAGE_SIZE];
+
+  while (current != INVALID_PAGE_NUM) {
+    if (current <= BP_HEADER_PAGE || current >= header_.page_count || guard++ > header_.page_count) {
+      stats_.corrupted.fetch_add(1, std::memory_order_relaxed);
+      return RC::BUFFERPOOL_CORRUPTED;
+    }
+    if (!free_pages_.insert(current).second) {
+      stats_.corrupted.fetch_add(1, std::memory_order_relaxed);
+      return RC::BUFFERPOOL_CORRUPTED;
+    }
+
+    RC rc = read_page_raw(current, raw);
+    if (OB_FAIL(rc)) {
+      return rc;
+    }
+    PageNum next = INVALID_PAGE_NUM;
+    memcpy(&next, raw, sizeof(next));
+    current = next;
   }
 
-  char page[BP_PAGE_SIZE];
-  memset(page, 0, sizeof(page));
-  memcpy(page, &header_, sizeof(header_));
-
-  RC rc = write_page(BP_HEADER_PAGE, page);
-  if (OB_FAIL(rc)) {
-    return rc;
+  if (static_cast<int32_t>(free_pages_.size()) != header_.free_page_count) {
+    stats_.corrupted.fetch_add(1, std::memory_order_relaxed);
+    return RC::BUFFERPOOL_CORRUPTED;
   }
-  header_dirty_ = false;
   return RC::SUCCESS;
 }
 
@@ -160,26 +428,22 @@ RC DiskBufferPool::seek(int64_t offset)
   return RC::SUCCESS;
 }
 
-RC DiskBufferPool::read_page(PageNum page_num, char *data)
+RC DiskBufferPool::read_page_raw(PageNum page_num, char *data)
 {
   RC rc = seek(static_cast<int64_t>(page_num) * BP_PAGE_SIZE);
   if (OB_FAIL(rc)) {
     return rc;
   }
-
   const size_t got = fread(data, 1, BP_PAGE_SIZE, handle_);
   if (got != BP_PAGE_SIZE) {
-    /// 文件被截断或未写满时，用空页兜底，保证上层拿到确定的页
-    memset(data + got, 0, BP_PAGE_SIZE - got);
-    if (got == 0) {
-      LOG_ERROR("failed to read page. file=%s, page_num=%d", file_name_.c_str(), page_num);
-      return RC::IOERR_READ;
-    }
+    LOG_ERROR("short page read. file=%s, page_num=%d, got=%d",
+              file_name_.c_str(), page_num, static_cast<int>(got));
+    return RC::BUFFERPOOL_CORRUPTED;
   }
   return RC::SUCCESS;
 }
 
-RC DiskBufferPool::write_page(PageNum page_num, const char *data)
+RC DiskBufferPool::write_page_raw(PageNum page_num, const char *data)
 {
   RC rc = seek(static_cast<int64_t>(page_num) * BP_PAGE_SIZE);
   if (OB_FAIL(rc)) {
@@ -192,47 +456,142 @@ RC DiskBufferPool::write_page(PageNum page_num, const char *data)
   return RC::SUCCESS;
 }
 
+RC DiskBufferPool::write_page_with_wal(PageNum page_num, const char *data)
+{
+  if (wal_) {
+    RC rc = wal_->append_and_sync(page_num, data);
+    if (OB_FAIL(rc)) {
+      LOG_ERROR("WAL append failed. file=%s, page_num=%d, rc=%s",
+                file_name_.c_str(), page_num, strrc(rc));
+      return rc;
+    }
+    stats_.wal_writes.fetch_add(1, std::memory_order_relaxed);
+    stats_.wal_syncs.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  RC rc = write_page_raw(page_num, data);
+  if (OB_SUCC(rc)) {
+    stats_.writes.fetch_add(1, std::memory_order_relaxed);
+  }
+  return rc;
+}
+
+RC DiskBufferPool::sync_data_file()
+{
+  if (handle_ == nullptr) {
+    return RC::FILE_NOT_OPENED;
+  }
+  if (mode_ == ReadWriteMode::READ_ONLY) {
+    return RC::SUCCESS;
+  }
+  RC rc = sync_file(handle_);
+  if (OB_FAIL(rc)) {
+    LOG_ERROR("failed to sync data file. file=%s, rc=%s", file_name_.c_str(), strrc(rc));
+  }
+  return rc;
+}
+
+Frame *DiskBufferPool::frame_at(FrameId frame_id) const
+{
+  if (frame_id < 0 || frame_id >= frame_limit_ || !frames_) {
+    return nullptr;
+  }
+  return &frames_[frame_id];
+}
+
+void DiskBufferPool::lock_frame_shared(FrameId frame_id)
+{
+  Frame *frame = frame_at(frame_id);
+  ASSERT(frame != nullptr, "invalid frame id. file=%s, frame=%d", file_name_.c_str(), frame_id);
+  frame->latch().lock_shared();
+}
+
+void DiskBufferPool::lock_frame_exclusive(FrameId frame_id)
+{
+  Frame *frame = frame_at(frame_id);
+  ASSERT(frame != nullptr, "invalid frame id. file=%s, frame=%d", file_name_.c_str(), frame_id);
+  frame->latch().lock();
+}
+
+void DiskBufferPool::unlock_frame_shared(FrameId frame_id)
+{
+  Frame *frame = frame_at(frame_id);
+  if (frame != nullptr) {
+    frame->latch().unlock_shared();
+  }
+}
+
+void DiskBufferPool::unlock_frame_exclusive(FrameId frame_id)
+{
+  Frame *frame = frame_at(frame_id);
+  if (frame != nullptr) {
+    frame->latch().unlock();
+  }
+}
+
+void DiskBufferPool::release_handle()
+{
+  const int old = active_handles_.fetch_sub(1, std::memory_order_acq_rel);
+  ASSERT(old > 0, "handle count underflow. file=%s", file_name_.c_str());
+}
+
 RC DiskBufferPool::allocate_page(PageNum *page_num)
 {
+  if (page_num == nullptr) {
+    return RC::INVALID_ARGUMENT;
+  }
+
+  std::lock_guard<std::mutex> guard(meta_mutex_);
+  if (closed_ || closing_) {
+    return RC::FILE_NOT_OPENED;
+  }
   if (mode_ == ReadWriteMode::READ_ONLY) {
     return RC::IOERR_ACCESS;
   }
 
   if (header_.first_free_page != INVALID_PAGE_NUM) {
-    /// 复用空闲链表上的页：页首 4 字节保存着下一个空闲页的页号
     const PageNum reuse = header_.first_free_page;
+    if (free_pages_.count(reuse) == 0) {
+      stats_.corrupted.fetch_add(1, std::memory_order_relaxed);
+      return RC::BUFFERPOOL_CORRUPTED;
+    }
 
     char raw[BP_PAGE_SIZE];
-    RC   rc = read_page(reuse, raw);
+    RC   rc = read_page_raw(reuse, raw);
     if (OB_FAIL(rc)) {
       return rc;
     }
 
     PageNum next_free = INVALID_PAGE_NUM;
     memcpy(&next_free, raw, sizeof(next_free));
-
+    if (next_free != INVALID_PAGE_NUM &&
+        (next_free <= BP_HEADER_PAGE || next_free >= header_.page_count)) {
+      stats_.corrupted.fetch_add(1, std::memory_order_relaxed);
+      return RC::BUFFERPOOL_CORRUPTED;
+    }
     memset(raw, 0, sizeof(raw));
-    rc = write_page(reuse, raw);
+    rc = write_page_with_wal(reuse, raw);
     if (OB_FAIL(rc)) {
       return rc;
     }
 
+    free_pages_.erase(reuse);
     header_.first_free_page = next_free;
     header_.free_page_count -= 1;
     header_dirty_           = true;
-
-    *page_num = reuse;
+    *page_num               = reuse;
     return RC::SUCCESS;
   }
 
-  char page[BP_PAGE_SIZE];
-  memset(page, 0, sizeof(page));
-  RC rc = write_page(header_.page_count, page);
+  const PageNum new_page = header_.page_count;
+  char          raw[BP_PAGE_SIZE];
+  memset(raw, 0, sizeof(raw));
+  RC rc = write_page_with_wal(new_page, raw);
   if (OB_FAIL(rc)) {
     return rc;
   }
 
-  *page_num             = header_.page_count;
+  *page_num             = new_page;
   header_.page_count   += 1;
   header_dirty_         = true;
   return RC::SUCCESS;
@@ -240,29 +599,43 @@ RC DiskBufferPool::allocate_page(PageNum *page_num)
 
 RC DiskBufferPool::dispose_page(PageNum page_num)
 {
+  std::lock_guard<std::mutex> guard(meta_mutex_);
+  if (closed_ || closing_) {
+    return RC::FILE_NOT_OPENED;
+  }
+  if (mode_ == ReadWriteMode::READ_ONLY) {
+    return RC::IOERR_ACCESS;
+  }
   if (page_num <= BP_HEADER_PAGE || page_num >= header_.page_count) {
-    LOG_ERROR("invalid page to dispose. file=%s, page_num=%d", file_name_.c_str(), page_num);
     return RC::BUFFERPOOL_INVALID_PAGE_NUM;
+  }
+  if (free_pages_.count(page_num) > 0) {
+    stats_.double_free.fetch_add(1, std::memory_order_relaxed);
+    return RC::BUFFERPOOL_DOUBLE_FREE;
   }
 
   FrameId frame_id = INVALID_FRAME_ID;
   if (page_table_.get(&frame_id, page_num)) {
-    if (frames_[frame_id].pin_count() > 0) {
+    Frame *frame = frame_at(frame_id);
+    if (frame == nullptr) {
+      return RC::BUFFERPOOL_CORRUPTED;
+    }
+    if (frame->pin_count() > 0) {
       LOG_ERROR("the page is pinned. file=%s, page_num=%d", file_name_.c_str(), page_num);
       return RC::BUFFERPOOL_PAGE_PINNED;
     }
     detach_page(page_num);
   }
 
-  /// 页首 4 字节保存下一个空闲页，形成单链表
-  char    raw[BP_PAGE_SIZE];
+  char raw[BP_PAGE_SIZE];
   memset(raw, 0, sizeof(raw));
   memcpy(raw, &header_.first_free_page, sizeof(header_.first_free_page));
-  RC rc = write_page(page_num, raw);
+  RC rc = write_page_with_wal(page_num, raw);
   if (OB_FAIL(rc)) {
     return rc;
   }
 
+  free_pages_.insert(page_num);
   header_.first_free_page = page_num;
   header_.free_page_count += 1;
   header_dirty_           = true;
@@ -276,243 +649,424 @@ void DiskBufferPool::detach_page(PageNum page_num)
     return;
   }
   page_table_.erase(page_num);
-  frames_[frame_id].reset();
-  frames_[frame_id].set_owner(this);
+  Frame *frame = frame_at(frame_id);
+  if (frame != nullptr) {
+    frame->reset();
+    frame->set_owner(this);
+  }
 }
 
-RC DiskBufferPool::allocate_frame(FrameId *frame_id)
+RC DiskBufferPool::allocate_frame_locked(FrameId *frame_id)
 {
-  const size_t total = frames_.size();
-  if (total == 0) {
+  if (frame_id == nullptr) {
+    return RC::INVALID_ARGUMENT;
+  }
+
+  const FrameId victim = replacement_.choose_victim(frames_.get(), static_cast<size_t>(frame_limit_));
+  if (victim == INVALID_FRAME_ID) {
+    stats_.no_buffer.fetch_add(1, std::memory_order_relaxed);
     return RC::BUFFERPOOL_NOBUF;
   }
 
-  /// 两圈：第一圈把引用位清零（第二次机会），第二圈一定能挑到候选帧
-  for (size_t round = 0; round < 2 * total; ++round) {
-    FrameId      fid = clock_hand_;
-    clock_hand_      = static_cast<FrameId>((clock_hand_ + 1) % total);
-
-    Frame &frame = frames_[fid];
-    if (frame.page_id() == INVALID_PAGE_NUM) {
-      *frame_id = fid;
-      return RC::SUCCESS;
-    }
-    if (frame.pin_count() > 0) {
-      continue;
-    }
-    /// 第二次机会：给过引用位，跳过
-    if (frame.referenced()) {
-      frame.set_referenced(false);
-      continue;
-    }
-
-    RC rc = evict_frame(fid);
-    if (OB_FAIL(rc)) {
-      return rc;
-    }
-    *frame_id = fid;
-    return RC::SUCCESS;
+  Frame *frame = frame_at(victim);
+  if (frame == nullptr) {
+    return RC::BUFFERPOOL_CORRUPTED;
   }
 
-  LOG_WARN("all frames are pinned. file=%s, frames=%d", file_name_.c_str(), (int)total);
-  return RC::BUFFERPOOL_NOBUF;
-}
-
-RC DiskBufferPool::evict_frame(FrameId frame_id)
-{
-  Frame &frame = frames_[frame_id];
-  if (frame.is_dirty()) {
-    RC rc = write_page(frame.page_id(), frame.data());
-    if (OB_FAIL(rc)) {
-      return rc;
+  if (frame->page_id() != INVALID_PAGE_NUM) {
+    if (frame->is_dirty()) {
+      RC rc = flush_frame_locked(*frame);
+      if (OB_FAIL(rc)) {
+        return rc;
+      }
+      stats_.dirty_evictions.fetch_add(1, std::memory_order_relaxed);
     }
+    page_table_.erase(frame->page_id());
+    frame->reset();
+    frame->set_owner(this);
+    stats_.evictions.fetch_add(1, std::memory_order_relaxed);
   }
-  page_table_.erase(frame.page_id());
-  frame.reset();
-  frame.set_owner(this);
+
+  *frame_id = victim;
   return RC::SUCCESS;
 }
 
-RC DiskBufferPool::get_page(PageNum page_num, PageHandle &handle)
+RC DiskBufferPool::flush_frame_locked(Frame &frame)
 {
+  if (!frame.is_dirty()) {
+    return RC::SUCCESS;
+  }
+  RC rc = write_page_with_wal(frame.page_id(), frame.data());
+  if (OB_SUCC(rc)) {
+    frame.clear_dirty();
+  }
+  return rc;
+}
+
+RC DiskBufferPool::flush_page(PageNum page_num)
+{
+  std::lock_guard<std::mutex> guard(flush_mutex_);
+  FrameId                     frame_id = INVALID_FRAME_ID;
+  {
+    std::lock_guard<std::mutex> meta_guard(meta_mutex_);
+    if (closed_) {
+      return RC::FILE_NOT_OPENED;
+    }
+    if (!page_table_.get(&frame_id, page_num)) {
+      return RC::SUCCESS;
+    }
+    Frame *frame = frame_at(frame_id);
+    if (frame == nullptr) {
+      return RC::BUFFERPOOL_CORRUPTED;
+    }
+    frame->increase_pin_count();
+  }
+
+  Frame *frame = frame_at(frame_id);
+  lock_frame_exclusive(frame_id);
+  RC rc = flush_frame_locked(*frame);
+  unlock_frame_exclusive(frame_id);
+  unpin_page(frame_id);
+  return rc;
+}
+
+RC DiskBufferPool::flush_all_buffers()
+{
+  std::vector<FrameId> dirty;
+  {
+    std::lock_guard<std::mutex> guard(meta_mutex_);
+    if (closed_) {
+      return RC::FILE_NOT_OPENED;
+    }
+    for (int i = 0; i < frame_limit_; ++i) {
+      Frame &frame = frames_[i];
+      if (frame.page_id() != INVALID_PAGE_NUM && frame.is_dirty()) {
+        frame.increase_pin_count();
+        dirty.push_back(static_cast<FrameId>(i));
+      }
+    }
+  }
+
+  std::lock_guard<std::mutex> flush_guard(flush_mutex_);
+  RC                          rc = RC::SUCCESS;
+  for (FrameId frame_id : dirty) {
+    Frame *frame = frame_at(frame_id);
+    if (frame == nullptr) {
+      rc = RC::BUFFERPOOL_CORRUPTED;
+      continue;
+    }
+    lock_frame_exclusive(frame_id);
+    RC one = flush_frame_locked(*frame);
+    unlock_frame_exclusive(frame_id);
+    unpin_page(frame_id);
+    if (OB_FAIL(one) && OB_SUCC(rc)) {
+      rc = one;
+    }
+  }
+
+  bool any_dirty = false;
+  {
+    std::lock_guard<std::mutex> guard(meta_mutex_);
+    if (OB_SUCC(rc) && header_dirty_) {
+      rc = write_header_locked();
+    }
+    if (OB_SUCC(rc)) {
+      for (int i = 0; i < frame_limit_; ++i) {
+        if (frames_[i].page_id() != INVALID_PAGE_NUM && frames_[i].is_dirty()) {
+          any_dirty = true;
+          break;
+        }
+      }
+    }
+  }
+
+  /// A page that became dirty after we collected the flush set, or a failed
+  /// flush, must keep its WAL records. Do not truncate the WAL in that case.
+  if (OB_SUCC(rc) && !any_dirty) {
+    rc = sync_data_file();
+    if (OB_SUCC(rc) && wal_) {
+      std::lock_guard<std::mutex> guard(meta_mutex_);
+      rc = wal_->checkpoint();
+      if (OB_SUCC(rc)) {
+        stats_.checkpoints.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+
+  stats_.flushes.fetch_add(1, std::memory_order_relaxed);
+  return rc;
+}
+
+RC DiskBufferPool::checkpoint() { return flush_all_buffers(); }
+
+RC DiskBufferPool::get_page(PageNum page_num, PageHandle &handle, PageAccess access)
+{
+  handle.reset();
+
+  std::unique_lock<std::mutex> guard(meta_mutex_);
+  if (closed_ || closing_) {
+    return RC::FILE_NOT_OPENED;
+  }
   if (page_num <= BP_HEADER_PAGE || page_num >= header_.page_count) {
     return RC::BUFFERPOOL_INVALID_PAGE_NUM;
+  }
+  if (free_pages_.count(page_num) > 0) {
+    return RC::BUFFERPOOL_PAGE_FREED;
   }
 
   FrameId frame_id = INVALID_FRAME_ID;
   if (page_table_.get(&frame_id, page_num)) {
-    Frame &frame = frames_[frame_id];
-    ASSERT(frame.page_id() == page_num, "page table is inconsistent. file=%s", file_name_.c_str());
-    frame.increase_pin_count();
-    handle = PageHandle(this, frame_id, page_num);
+    Frame *frame = frame_at(frame_id);
+    if (frame == nullptr) {
+      return RC::BUFFERPOOL_CORRUPTED;
+    }
+    frame->increase_pin_count();
+    replacement_.on_access(*frame);
+    active_handles_.fetch_add(1, std::memory_order_acq_rel);
+    stats_.hits.fetch_add(1, std::memory_order_relaxed);
+    guard.unlock();
+
+    if (access == PageAccess::READ) {
+      lock_frame_shared(frame_id);
+    } else if (access == PageAccess::WRITE) {
+      lock_frame_exclusive(frame_id);
+    }
+
+    handle = PageHandle(this, frame_id, page_num, access);
     return RC::SUCCESS;
   }
 
-  RC rc = allocate_frame(&frame_id);
+  RC rc = allocate_frame_locked(&frame_id);
   if (OB_FAIL(rc)) {
     return rc;
   }
 
-  Frame &frame = frames_[frame_id];
-  rc           = read_page(page_num, frame.data());
+  Frame *frame = frame_at(frame_id);
+  if (frame == nullptr) {
+    return RC::BUFFERPOOL_CORRUPTED;
+  }
+
+  rc = read_page_raw(page_num, frame->data());
   if (OB_FAIL(rc)) {
-    frame.reset();
-    frame.set_owner(this);
+    frame->reset();
+    frame->set_owner(this);
     return rc;
   }
 
-  frame.set_page_id(page_num);
-  frame.clear_dirty();
-  frame.set_referenced(true);
-  frame.increase_pin_count();
+  frame->set_page_id(page_num);
+  frame->clear_dirty();
+  frame->set_pin_count(1);
+  replacement_.on_access(*frame);
   page_table_.insert(page_num, frame_id);
+  active_handles_.fetch_add(1, std::memory_order_acq_rel);
+  stats_.misses.fetch_add(1, std::memory_order_relaxed);
+  stats_.reads.fetch_add(1, std::memory_order_relaxed);
+  guard.unlock();
 
-  handle = PageHandle(this, frame_id, page_num);
+  if (access == PageAccess::READ) {
+    lock_frame_shared(frame_id);
+  } else if (access == PageAccess::WRITE) {
+    lock_frame_exclusive(frame_id);
+  }
+
+  handle = PageHandle(this, frame_id, page_num, access);
   return RC::SUCCESS;
+}
+
+RC DiskBufferPool::get_page_read(PageNum page_num, PageHandle &handle)
+{
+  return get_page(page_num, handle, PageAccess::READ);
+}
+
+RC DiskBufferPool::get_page_write(PageNum page_num, PageHandle &handle)
+{
+  return get_page(page_num, handle, PageAccess::WRITE);
 }
 
 RC DiskBufferPool::unpin_page(FrameId frame_id)
 {
-  if (frame_id < 0 || frame_id >= static_cast<FrameId>(frames_.size())) {
+  Frame *frame = frame_at(frame_id);
+  if (frame == nullptr) {
     return RC::INVALID_ARGUMENT;
   }
-
-  Frame &frame = frames_[frame_id];
-  ASSERT(frame.pin_count() > 0, "unpin a page which is not pinned. file=%s", file_name_.c_str());
-  frame.decrease_pin_count();
-  if (frame.pin_count() == 0) {
-    frame.set_referenced(true);  /// 重新加入时钟算法的候选集
+  const int old = frame->pin_count();
+  if (old <= 0) {
+    ASSERT(false, "unpin a page which is not pinned. file=%s, frame=%d", file_name_.c_str(), frame_id);
+    return RC::INVALID_ARGUMENT;
   }
+  frame->decrease_pin_count();
   return RC::SUCCESS;
 }
 
 RC DiskBufferPool::mark_page_dirty(FrameId frame_id)
 {
-  if (frame_id < 0 || frame_id >= static_cast<FrameId>(frames_.size())) {
+  Frame *frame = frame_at(frame_id);
+  if (frame == nullptr) {
     return RC::INVALID_ARGUMENT;
   }
   if (mode_ == ReadWriteMode::READ_ONLY) {
     return RC::IOERR_ACCESS;
   }
-  frames_[frame_id].mark_dirty();
+  frame->mark_dirty();
   return RC::SUCCESS;
 }
 
 char *DiskBufferPool::frame_data(FrameId frame_id)
 {
-  ASSERT(frame_id >= 0 && frame_id < static_cast<FrameId>(frames_.size()),
-         "invalid frame id. file=%s, frame_id=%d", file_name_.c_str(), frame_id);
-  return frames_[frame_id].data();
+  Frame *frame = frame_at(frame_id);
+  ASSERT(frame != nullptr, "invalid frame id. file=%s, frame=%d", file_name_.c_str(), frame_id);
+  return frame->data();
 }
 
-RC DiskBufferPool::flush_all_buffers()
+RC DiskBufferPool::prefetch_page(PageNum page_num)
 {
-  for (Frame &frame : frames_) {
-    if (frame.is_dirty()) {
-      RC rc = write_page(frame.page_id(), frame.data());
-      if (OB_FAIL(rc)) {
-        return rc;
-      }
-      frame.clear_dirty();
-    }
+  PageHandle handle;
+  RC         rc = get_page_read(page_num, handle);
+  if (OB_SUCC(rc)) {
+    stats_.prefetches.fetch_add(1, std::memory_order_relaxed);
+    handle.reset();
   }
+  return rc;
+}
 
-  if (header_dirty_) {
-    RC rc = write_header();
+RC DiskBufferPool::prefetch_range(PageNum start_page, int count)
+{
+  if (count < 0) {
+    return RC::INVALID_ARGUMENT;
+  }
+  for (int i = 0; i < count; ++i) {
+    RC rc = prefetch_page(start_page + i);
     if (OB_FAIL(rc)) {
       return rc;
     }
   }
-
-  if (handle_ != nullptr && fflush(handle_) != 0) {
-    return RC::IOERR_SYNC;
-  }
   return RC::SUCCESS;
-}
-
-RC DiskBufferPool::close()
-{
-  if (handle_ == nullptr) {
-    return RC::SUCCESS;
-  }
-
-  RC rc = flush_all_buffers();
-  if (OB_FAIL(rc)) {
-    LOG_ERROR("failed to flush buffer pool on close. file=%s, rc=%s", file_name_.c_str(), strrc(rc));
-  }
-
-  fclose(handle_);
-  handle_     = nullptr;
-  page_table_.clear();
-  frames_.clear();
-  return rc;
 }
 
 // ---------------------------------------------------------------------------
 // DiskBufferPoolManager
 // ---------------------------------------------------------------------------
 
+DiskBufferPoolManager::DiskBufferPoolManager(int frame_limit_per_file, int total_frame_limit)
+    : frame_limit_(std::max(1, frame_limit_per_file)),
+      total_frame_limit_(std::max(1, total_frame_limit))
+{}
+
+DiskBufferPoolManager::~DiskBufferPoolManager()
+{
+  RC rc = close();
+  if (OB_FAIL(rc)) {
+    LOG_WARN("buffer pool manager close on destruction failed. rc=%s", strrc(rc));
+  }
+}
+
+std::string DiskBufferPoolManager::normalize_path(const std::string &path)
+{
+  std::error_code ec;
+  auto            absolute = std::filesystem::absolute(path, ec);
+  if (ec) {
+    return path;
+  }
+  return absolute.lexically_normal().string();
+}
+
 RC DiskBufferPoolManager::create_file(const std::string &path)
 {
+  const std::string normalized = normalize_path(path);
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (by_path_.find(normalized) != by_path_.end()) {
+    return RC::BUFFERPOOL_OPEN;
+  }
+  if (std::filesystem::exists(normalized)) {
+    return RC::FILE_EXIST;
+  }
+
   DiskBufferPool pool;
-  return pool.create_file(path);
+  return pool.create_file(normalized);
 }
 
 RC DiskBufferPoolManager::open_file(const std::string &path, ReadWriteMode mode, DiskBufferPool **pool)
 {
-  auto iter = by_path_.find(path);
+  if (pool == nullptr) {
+    return RC::INVALID_ARGUMENT;
+  }
+
+  const std::string normalized = normalize_path(path);
+  std::lock_guard<std::mutex> guard(mutex_);
+
+  auto iter = by_path_.find(normalized);
   if (iter != by_path_.end()) {
-    *pool = iter->second;
+    DiskBufferPool *existing = iter->second;
+    if (mode == ReadWriteMode::READ_WRITE && existing->is_read_only()) {
+      return RC::IOERR_ACCESS;
+    }
+    *pool = existing;
     return RC::SUCCESS;
   }
 
+  const int remaining = total_frame_limit_ - used_frames_;
+  const int limit     = std::min(frame_limit_, remaining);
+  if (limit <= 0) {
+    return RC::BUFFERPOOL_NOBUF;
+  }
+
   auto owner = std::make_unique<DiskBufferPool>();
-  RC   rc    = owner->open(path, mode, frame_limit_);
+  RC   rc    = owner->open(normalized, mode, limit, true);
   if (OB_FAIL(rc)) {
-    LOG_ERROR("failed to open buffer pool file. path=%s, rc=%s", path.c_str(), strrc(rc));
+    LOG_ERROR("failed to open buffer pool file. path=%s, rc=%s", normalized.c_str(), strrc(rc));
     return rc;
   }
 
   DiskBufferPool *raw = owner.get();
+  used_frames_ += limit;
   pools_.push_back(std::move(owner));
-  by_path_[path] = raw;
-
+  by_path_[normalized] = raw;
   *pool = raw;
   return RC::SUCCESS;
 }
 
 DiskBufferPool *DiskBufferPoolManager::get_pool(const std::string &path) const
 {
-  auto iter = by_path_.find(path);
+  const std::string normalized = normalize_path(path);
+  std::lock_guard<std::mutex> guard(mutex_);
+  auto iter = by_path_.find(normalized);
   return iter == by_path_.end() ? nullptr : iter->second;
 }
 
 RC DiskBufferPoolManager::close_file(const std::string &path)
 {
-  auto iter = by_path_.find(path);
+  const std::string normalized = normalize_path(path);
+  std::lock_guard<std::mutex> guard(mutex_);
+
+  auto iter = by_path_.find(normalized);
   if (iter == by_path_.end()) {
     return RC::FILE_NOT_EXIST;
   }
 
   DiskBufferPool *target = iter->second;
+  const int       frames = target->frame_limit();
   RC              rc     = target->close();
-
-  by_path_.erase(iter);
-  for (auto it = pools_.begin(); it != pools_.end(); ++it) {
-    if (it->get() == target) {
-      pools_.erase(it);
-      break;
-    }
+  if (OB_FAIL(rc)) {
+    return rc;
   }
-  return rc;
+
+  used_frames_ -= frames;
+  by_path_.erase(iter);
+  pools_.erase(std::remove_if(pools_.begin(), pools_.end(),
+                              [target](const std::unique_ptr<DiskBufferPool> &pool) {
+                                return pool.get() == target;
+                              }),
+               pools_.end());
+  return RC::SUCCESS;
 }
 
 RC DiskBufferPoolManager::flush_all()
 {
-  RC rc = RC::SUCCESS;
+  std::lock_guard<std::mutex> guard(mutex_);
+  RC                          rc = RC::SUCCESS;
   for (auto &pool : pools_) {
     RC one = pool->flush_all_buffers();
-    if (OB_FAIL(one)) {
+    if (OB_FAIL(one) && OB_SUCC(rc)) {
       rc = one;
     }
   }
@@ -521,14 +1075,30 @@ RC DiskBufferPoolManager::flush_all()
 
 RC DiskBufferPoolManager::close()
 {
-  RC rc = RC::SUCCESS;
+  std::lock_guard<std::mutex> guard(mutex_);
+  RC                          rc = RC::SUCCESS;
   for (auto &pool : pools_) {
     RC one = pool->close();
-    if (OB_FAIL(one)) {
+    if (OB_FAIL(one) && OB_SUCC(rc)) {
       rc = one;
     }
   }
-  pools_.clear();
-  by_path_.clear();
+  if (OB_SUCC(rc)) {
+    pools_.clear();
+    by_path_.clear();
+    used_frames_ = 0;
+  }
   return rc;
+}
+
+int DiskBufferPoolManager::used_frames() const
+{
+  std::lock_guard<std::mutex> guard(mutex_);
+  return used_frames_;
+}
+
+int DiskBufferPoolManager::remaining_frames() const
+{
+  std::lock_guard<std::mutex> guard(mutex_);
+  return total_frame_limit_ - used_frames_;
 }

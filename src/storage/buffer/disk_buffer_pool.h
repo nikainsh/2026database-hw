@@ -1,47 +1,78 @@
-/* minidb - a minimal relational DBMS, architecture follows oceanbase/miniob */
-
+/* database26 buffer manager - thread-safe page cache with WAL */
 #pragma once
 
-#include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "common/rc.h"
 #include "common/types.h"
+#include "storage/buffer/buffer_pool_stats.h"
 #include "storage/buffer/frame.h"
 #include "storage/buffer/page.h"
+#include "storage/buffer/page_wal.h"
+#include "storage/buffer/replacement.h"
 
 class DiskBufferPool;
+class PageHandle;
 
-/// 文件头魔数：'M''B''P''1'
-static constexpr int32_t BP_FILE_MAGIC = 0x4D425031;
+/// File header magic: 'M''B''P''2'
+static constexpr uint32_t BP_FILE_MAGIC = 0x4D425032u;
+static constexpr uint16_t BP_FORMAT_VERSION = 2;
 
+#pragma pack(push, 1)
 /**
- * @brief 每个磁盘文件第 0 页的固定内容
- * @details 空闲页用单链表串起来：被释放页的前 4 个字节保存下一个空闲页的页号。
+ * @brief Page 0 of every buffer-pool file.
+ *
+ * Layout is versioned and packed. Page 1 is intentionally left to the upper
+ * layer (record file header / index header), so the buffer manager only owns
+ * page 0 plus page-number allocation metadata.
  */
 struct DiskFileHeader
 {
-  int32_t magic           = BP_FILE_MAGIC;
-  int32_t page_size       = BP_PAGE_SIZE;
-  int32_t page_count      = 1;  /// 已分配的页数，包含第 0 页
-  int32_t first_free_page = INVALID_PAGE_NUM;
-  int32_t free_page_count = 0;
+  uint32_t magic           = BP_FILE_MAGIC;
+  uint16_t version         = BP_FORMAT_VERSION;
+  uint16_t header_size     = 0;
+  uint32_t page_size       = BP_PAGE_SIZE;
+  int32_t  page_count      = 1;
+  int32_t  first_free_page = INVALID_PAGE_NUM;
+  int32_t  free_page_count = 0;
+  uint64_t checkpoint_lsn  = 0;
+  uint32_t header_crc      = 0;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(DiskFileHeader) <= BP_PAGE_SIZE, "buffer pool header is too large");
+
+enum class PageAccess
+{
+  /// Compatibility mode: pin only, no page latch. Existing callers keep
+  /// working, but multi-threaded callers must use READ or WRITE explicitly.
+  NONE,
+  READ,
+  WRITE,
 };
 
 /**
- * @brief 一次页访问的句柄，析构时自动 unpin
- * @details miniob 需要手工调用 unpin_page，这里改成 RAII 以避免漏放 pin 导致帧无法被淘汰。
+ * @brief RAII page handle.
+ *
+ * The handle holds a shared (READ) or exclusive (WRITE) page latch until reset
+ * or destruction. It also owns one pin on the frame, so the frame cannot be
+ * evicted while the handle is alive.
  */
 class PageHandle
 {
 public:
   PageHandle() = default;
-  PageHandle(const PageHandle &other)            = delete;
-  PageHandle &operator=(const PageHandle &other) = delete;
+  PageHandle(const PageHandle &)            = delete;
+  PageHandle &operator=(const PageHandle &) = delete;
 
   PageHandle(PageHandle &&other) noexcept { swap(other); }
   PageHandle &operator=(PageHandle &&other) noexcept
@@ -60,113 +91,187 @@ public:
     std::swap(pool_, other.pool_);
     std::swap(frame_id_, other.frame_id_);
     std::swap(page_id_, other.page_id_);
+    std::swap(access_, other.access_);
   }
 
-  void     reset();
+  void reset();
 
   char       *value() const;
   const char *const_data() const { return value(); }
   PageNum     page_id() const { return page_id_; }
   FrameId     frame_id() const { return frame_id_; }
+  PageAccess  access() const { return access_; }
   bool        valid() const { return pool_ != nullptr; }
 
-  /// 修改页内容后必须调用，否则页不会写回磁盘
+  /// Modify page content only through a WRITE handle, then call mark_dirty().
   RC mark_dirty();
 
 private:
   friend class DiskBufferPool;
-  PageHandle(DiskBufferPool *pool, FrameId frame_id, PageNum page_id)
-      : pool_(pool), frame_id_(frame_id), page_id_(page_id)
+  PageHandle(DiskBufferPool *pool, FrameId frame_id, PageNum page_id, PageAccess access)
+      : pool_(pool), frame_id_(frame_id), page_id_(page_id), access_(access)
   {}
 
   DiskBufferPool *pool_     = nullptr;
   FrameId         frame_id_ = INVALID_FRAME_ID;
   PageNum         page_id_  = INVALID_PAGE_NUM;
+  PageAccess      access_   = PageAccess::NONE;
 };
 
 /**
- * @brief 缓冲管理器：一个磁盘文件对应一个实例
- * @details 负责 读页/写页、帧分配（时钟替换算法）、pin 计数、脏页回写、页的分配与释放。
+ * @brief One buffer pool per disk file.
+ *
+ * Thread-safety:
+ *   - meta_mutex_ protects the page table, free list, header, replacement
+ *     history, and frame metadata.
+ *   - Each Frame has a shared_mutex protecting its 8KB page bytes.
+ *   - pin_count and dirty are atomic.
+ *   - Page misses / eviction / WAL appends are serialized by meta_mutex_ and
+ *     flush_mutex_. This is correct but not the final word in scalability.
  */
 class DiskBufferPool
 {
 public:
-  DiskBufferPool() = default;
+  DiskBufferPool();
   ~DiskBufferPool();
 
+  DiskBufferPool(const DiskBufferPool &)            = delete;
+  DiskBufferPool &operator=(const DiskBufferPool &) = delete;
+
   RC create_file(const std::string &path);
-  RC open(const std::string &path, ReadWriteMode mode, int frame_limit);
+  RC open(const std::string &path, ReadWriteMode mode, int frame_limit, bool enable_wal = true);
   RC close();
 
   const std::string &file_name() const { return file_name_; }
-  PageNum              page_count() const { return header_.page_count; }
-  int32_t              free_page_count() const { return header_.free_page_count; }
+  const std::string &wal_file_name() const { return wal_path_; }
 
-  /// 分配一个新页（优先复用空闲页）。返回的页已经清零，调用方随后 get_page 使用。
+  PageNum page_count() const;
+  int32_t free_page_count() const;
+  int     frame_limit() const { return frame_limit_; }
+  bool    is_read_only() const { return mode_ == ReadWriteMode::READ_ONLY; }
+  bool    is_open() const;
+
+  BufferPoolStatsSnapshot stats() const { return stats_.snapshot(); }
+
+  /// Allocate a zero-filled page. The page is not returned pinned; call get_page.
   RC allocate_page(PageNum *page_num);
-  /// 释放一个页，进入空闲链表；该页必须未被 pin
+  /// Dispose an unpinned page and put it on the free list.
   RC dispose_page(PageNum page_num);
 
-  /// 取出一页并 pin，句柄析构时自动 unpin
-  RC get_page(PageNum page_num, PageHandle &handle);
+  /// Default is pin-only (NONE) for source compatibility. Multi-threaded
+  /// callers should use get_page_read() / get_page_write().
+  RC get_page(PageNum page_num, PageHandle &handle, PageAccess access = PageAccess::NONE);
+  RC get_page_read(PageNum page_num, PageHandle &handle);
+  RC get_page_write(PageNum page_num, PageHandle &handle);
+
   RC unpin_page(FrameId frame_id);
-  /// 页内容被修改后调用，页才会在淘汰或 flush 时写回磁盘
   RC mark_page_dirty(FrameId frame_id);
 
-  /// 把所有脏页写回磁盘，对应 miniob 的 flush_all_buffers
+  /// Flush one cached page if dirty. Page must not be locked by a writer.
+  RC flush_page(PageNum page_num);
+  /// Flush all dirty pages, fsync data, then truncate the WAL (checkpoint).
   RC flush_all_buffers();
+  /// Alias for flush_all_buffers().
+  RC checkpoint();
 
-  bool is_read_only() const { return mode_ == ReadWriteMode::READ_ONLY; }
+  /// Synchronous warm-up prefetch: read the page into the cache and unpin it.
+  RC prefetch_page(PageNum page_num);
+  RC prefetch_range(PageNum start_page, int count);
 
-  /// PageHandle::value() 的实现，返回帧内页数据缓冲区
+  /// PageHandle::value() implementation.
   char *frame_data(FrameId frame_id);
 
 private:
-  RC read_header();
-  RC write_header();
-  RC read_page(PageNum page_num, char *data);
-  RC write_page(PageNum page_num, const char *data);
-  RC seek(int64_t offset);
+  friend class PageHandle;
 
-  /// 时钟替换算法挑一个可用的帧；frame_id 返回被选中的帧（已保证未 pin、已写回）
-  RC allocate_frame(FrameId *frame_id);
-  RC evict_frame(FrameId frame_id);
+  RC read_header();
+  RC write_header_locked();
+  RC validate_header() const;
+  RC validate_free_list();
+
+  RC read_page_raw(PageNum page_num, char *data);
+  RC write_page_raw(PageNum page_num, const char *data);
+  RC write_page_with_wal(PageNum page_num, const char *data);
+  RC seek(int64_t offset);
+  RC sync_data_file();
+
+  RC allocate_frame_locked(FrameId *frame_id);
+  RC flush_frame_locked(Frame &frame);
 
   void detach_page(PageNum page_num);
 
-private:
-  std::string    file_name_;
-  FILE          *handle_       = nullptr;
-  ReadWriteMode  mode_         = ReadWriteMode::READ_ONLY;
-  DiskFileHeader header_;
-  bool           header_dirty_ = false;
+  void lock_frame_shared(FrameId frame_id);
+  void lock_frame_exclusive(FrameId frame_id);
+  void unlock_frame_shared(FrameId frame_id);
+  void unlock_frame_exclusive(FrameId frame_id);
+  void release_handle();
 
-  std::vector<Frame> frames_;
-  PageTable          page_table_;
-  FrameId            clock_hand_ = 0;
+  Frame *frame_at(FrameId frame_id) const;
+
+private:
+  std::string   file_name_;
+  std::string   wal_path_;
+  FILE         *handle_ = nullptr;
+  ReadWriteMode mode_   = ReadWriteMode::READ_ONLY;
+  bool          enable_wal_ = true;
+  bool          header_dirty_ = false;
+  bool          closed_       = true;
+  bool          closing_      = false;
+
+  DiskFileHeader header_;
+  std::unique_ptr<Frame[]> frames_;
+  int                      frame_limit_ = 0;
+  PageTable                page_table_;
+  std::unordered_set<PageNum> free_pages_;
+  LruKPolicy               replacement_{2};
+  std::unique_ptr<PageWAL> wal_;
+
+  mutable std::mutex meta_mutex_;
+  std::mutex         flush_mutex_;
+  std::atomic<int>   active_handles_{0};
+
+  mutable BufferPoolStats stats_;
 };
 
 /**
- * @brief 缓冲池管理器：按路径持有所有打开的文件，对应 miniob 的 DiskBufferPoolManager
+ * @brief Manages all open buffer pools.
+ *
+ * A global frame budget (total_frame_limit) prevents "32 frames per file"
+ * from growing without bound when many tables/indexes are open. Eviction is
+ * still per-file; a later iteration can lift replacement to a truly global
+ * frame manager.
  */
 class DiskBufferPoolManager
 {
 public:
-  explicit DiskBufferPoolManager(int frame_limit_per_file = 32) : frame_limit_(frame_limit_per_file) {}
+  explicit DiskBufferPoolManager(int frame_limit_per_file = 32, int total_frame_limit = 4096);
+  ~DiskBufferPoolManager();
+
+  DiskBufferPoolManager(const DiskBufferPoolManager &)            = delete;
+  DiskBufferPoolManager &operator=(const DiskBufferPoolManager &) = delete;
 
   RC create_file(const std::string &path);
-  /// 同一个路径只会打开一份，重复调用返回已打开的实例
   RC open_file(const std::string &path, ReadWriteMode mode, DiskBufferPool **pool);
   RC close_file(const std::string &path);
   RC close();
-  /// 把当前打开的所有文件里的脏页写回磁盘
   RC flush_all();
 
   DiskBufferPool *get_pool(const std::string &path) const;
   bool            is_open(const std::string &path) const { return get_pool(path) != nullptr; }
 
+  int  total_frame_limit() const { return total_frame_limit_; }
+  int  used_frames() const;
+  int  remaining_frames() const;
+
 private:
-  int frame_limit_ = 32;
+  static std::string normalize_path(const std::string &path);
+
+private:
+  int frame_limit_       = 32;
+  int total_frame_limit_ = 4096;
+  int used_frames_       = 0;
+
+  mutable std::mutex mutex_;
   std::vector<std::unique_ptr<DiskBufferPool>> pools_;
   std::unordered_map<std::string, DiskBufferPool *> by_path_;
 };
