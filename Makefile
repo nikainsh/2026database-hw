@@ -40,7 +40,12 @@ endif
 # -MMD -MP：随编译生成 .d 依赖文件，改头文件只重编真正依赖它的 .cpp
 CXXFLAGS := $(CXXSTD) $(OPT) $(WARNINGS) $(INCLUDES) $(CXXFLAGS_EXTRA) -MMD -MP
 
-LIB_SRCS  := $(shell find src -name '*.cpp' ! -name 'main.cpp' | sort)
+# 同 build.sh 里的坑：Windows 上 `find` 可能被 C:\WINDOWS\system32\find.exe（文本搜索工具）抢走，
+# 导致 LIB_SRCS 为空、链接报 undefined reference。优先用 MSYS/Git 的 GNU find，
+# 找不到再退回 PATH 里的 find（Linux/macOS 下 /usr/bin/find 就是 GNU find）。
+# 也可以用 `make FIND=/path/to/find` 强制指定。
+FIND      ?= $(shell command -v /usr/bin/find 2>/dev/null || command -v find 2>/dev/null)
+LIB_SRCS  := $(shell $(FIND) src -name '*.cpp' ! -name 'main.cpp' | sort)
 LIB_OBJS  := $(patsubst %.cpp,$(OBJDIR)/%.o,$(LIB_SRCS))
 MAIN_OBJ  := $(OBJDIR)/src/shell/main.o
 TEST_SRCS := $(wildcard tests/test_*.cpp)

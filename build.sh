@@ -9,6 +9,12 @@
 # 增量编译靠 -MMD 生成的 .d 依赖文件，所以改头文件只会重编真正依赖它的 .cpp。
 set -e
 
+# Windows(Git Bash) 从系统继承的 PATH 里 C:\WINDOWS\system32 排在 /usr/bin 前面，
+# 于是下面收集源码用的 `find` 会命中 Windows 自带的 find.exe —— 那是个文本搜索工具，
+# 不认 -name，输出为空 => 源码列表变空 => 只链接 main.cpp => 报一屏 undefined reference。
+# 这里显式把 Git 自带的 GNU coreutils 放到 PATH 最前；Linux/macOS 上 /usr/bin 本来就在 PATH 里，无副作用。
+export PATH="/usr/bin:${PATH}"
+
 CXX=${CXX:-g++}
 
 # 把编译器身份放进对象目录名：两套不同的 MinGW/ GCC 永远不会共用同一堆 .o，
