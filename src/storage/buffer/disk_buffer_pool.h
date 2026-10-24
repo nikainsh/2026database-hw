@@ -53,9 +53,6 @@ static_assert(sizeof(DiskFileHeader) <= BP_PAGE_SIZE, "buffer pool header is too
 
 enum class PageAccess
 {
-  /// Compatibility mode: pin only, no page latch. Existing callers keep
-  /// working, but multi-threaded callers must use READ or WRITE explicitly.
-  NONE,
   READ,
   WRITE,
 };
@@ -115,7 +112,7 @@ private:
   DiskBufferPool *pool_     = nullptr;
   FrameId         frame_id_ = INVALID_FRAME_ID;
   PageNum         page_id_  = INVALID_PAGE_NUM;
-  PageAccess      access_   = PageAccess::NONE;
+  PageAccess      access_   = PageAccess::READ;
 };
 
 /**
@@ -158,9 +155,8 @@ public:
   /// Dispose an unpinned page and put it on the free list.
   RC dispose_page(PageNum page_num);
 
-  /// Default is pin-only (NONE) for source compatibility. Multi-threaded
-  /// callers should use get_page_read() / get_page_write().
-  RC get_page(PageNum page_num, PageHandle &handle, PageAccess access = PageAccess::NONE);
+  /// Explicit access is required. Use get_page_read() / get_page_write().
+  RC get_page(PageNum page_num, PageHandle &handle, PageAccess access);
   RC get_page_read(PageNum page_num, PageHandle &handle);
   RC get_page_write(PageNum page_num, PageHandle &handle);
 

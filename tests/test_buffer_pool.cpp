@@ -16,7 +16,7 @@ static const std::string kBig  = "./_test_buf/bp_big.dat";
 static void write_pattern(DiskBufferPool &pool, PageNum page_num, int seed)
 {
   PageHandle handle;
-  assert(OB_SUCC(pool.get_page(page_num, handle)));
+  assert(OB_SUCC(pool.get_page_write(page_num, handle)));
   int32_t *words = reinterpret_cast<int32_t *>(handle.value());
   for (int i = 0; i < BP_PAGE_SIZE / (int)sizeof(int32_t); ++i) {
     words[i] = seed * 1000 + i;
@@ -28,7 +28,7 @@ static void write_pattern(DiskBufferPool &pool, PageNum page_num, int seed)
 static void check_pattern(DiskBufferPool &pool, PageNum page_num, int seed)
 {
   PageHandle handle;
-  assert(OB_SUCC(pool.get_page(page_num, handle)));
+  assert(OB_SUCC(pool.get_page_read(page_num, handle)));
   const int32_t *words = reinterpret_cast<const int32_t *>(handle.const_data());
   for (int i = 0; i < BP_PAGE_SIZE / (int)sizeof(int32_t); ++i) {
     assert(words[i] == seed * 1000 + i);
@@ -61,8 +61,8 @@ static void test_allocate_flush_reload()
 
   /// 第 0 页由缓冲池内部维护，不允许上层直接访问
   PageHandle header_handle;
-  assert(pool->get_page(BP_HEADER_PAGE, header_handle) == RC::BUFFERPOOL_INVALID_PAGE_NUM);
-  assert(pool->get_page(21, header_handle) == RC::BUFFERPOOL_INVALID_PAGE_NUM);
+  assert(pool->get_page_read(BP_HEADER_PAGE, header_handle) == RC::BUFFERPOOL_INVALID_PAGE_NUM);
+  assert(pool->get_page_read(21, header_handle) == RC::BUFFERPOOL_INVALID_PAGE_NUM);
 
   assert(OB_SUCC(bpm.close()));  /// flush 全部脏页并关闭
 
@@ -89,14 +89,14 @@ static void test_allocate_flush_reload()
 
   {
     PageHandle handle;
-    assert(OB_SUCC(pool2->get_page(reuse, handle)));
+    assert(OB_SUCC(pool2->get_page_read(reuse, handle)));
     const int32_t *words = reinterpret_cast<const int32_t *>(handle.const_data());
     assert(words[0] == 0 && words[1] == 0);  /// 复用时已经清零
   }
 
   /// 被 pin 的页不能被释放
   PageHandle pinned;
-  assert(OB_SUCC(pool2->get_page(pages[0], pinned)));
+  assert(OB_SUCC(pool2->get_page_read(pages[0], pinned)));
   assert(pool2->dispose_page(pages[0]) == RC::BUFFERPOOL_PAGE_PINNED);
   pinned.reset();
   assert(OB_SUCC(pool2->dispose_page(pages[0])));
@@ -135,13 +135,15 @@ static void test_all_frames_pinned()
   assert(OB_SUCC(bpm.open_file(kFile, ReadWriteMode::READ_WRITE, &pool)));
 
   PageHandle h1, h2, h3;
-  assert(OB_SUCC(pool->get_page(2, h1)));
-  assert(OB_SUCC(pool->get_page(3, h2)));
+  assert(OB_SUCC(pool->get_page_write(2, h1)));
+  assert(OB_SUCC(pool->get_page_write(3, h2)));
+  const FrameId first_frame = h1.frame_id();
   /// 两帧都被 pin，再取别的页会直接失败，而不是死循环
-  assert(pool->get_page(4, h3) == RC::BUFFERPOOL_NOBUF);
-  /// 已 pin 过的页可以从页表命中
-  assert(OB_SUCC(pool->get_page(2, h3)));
-  assert(h3.frame_id() == h1.frame_id());
+  assert(pool->get_page_write(4, h3) == RC::BUFFERPOOL_NOBUF);
+  /// 释放一帧后，同一页可以从页表命中并复用该 frame
+  h1.reset();
+  assert(OB_SUCC(pool->get_page_write(2, h3)));
+  assert(h3.frame_id() == first_frame);
 }
 
 int main()

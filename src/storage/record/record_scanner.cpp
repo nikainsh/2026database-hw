@@ -2,6 +2,8 @@
 
 #include "storage/record/record_scanner.h"
 
+#include <algorithm>
+
 #include "storage/record/slotted_page.h"
 
 RC RecordScanner::init(HeapRecordManager *manager)
@@ -40,7 +42,7 @@ RC RecordScanner::next(Record &record)
       if (current_page_ >= buffer_pool_->page_count()) {
         return RC::RECORD_EOF;
       }
-      RC rc = buffer_pool_->get_page(current_page_, handle_);
+      RC rc = buffer_pool_->get_page_read(current_page_, handle_);
       if (OB_FAIL(rc)) {
         return rc;
       }
@@ -64,5 +66,16 @@ RC RecordScanner::next(Record &record)
 
     handle_.reset();
     current_page_ += 1;
+
+    /// Sequential scan hint: warm the next few pages after releasing the
+    /// current one. This is a synchronous prefetch in the current buffer
+    /// manager, but it still removes the page-fault stall from the hot path.
+    if (current_page_ % 4 == 0) {
+      const PageNum end = buffer_pool_->page_count();
+      if (current_page_ + 1 < end) {
+        const int count = std::min<int>(4, end - current_page_ - 1);
+        buffer_pool_->prefetch_range(current_page_ + 1, count);
+      }
+    }
   }
 }

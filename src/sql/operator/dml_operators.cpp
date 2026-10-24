@@ -42,9 +42,42 @@ RC DeleteOperator::open()
   if (children_.empty()) {
     return RC::INTERNAL;
   }
-  affected_rows_ = 0;
-  finished_      = false;
-  return children_[0]->open();
+  affected_rows_   = 0;
+  finished_        = false;
+  next_rid_index_  = 0;
+  rids_.clear();
+
+  RC rc = children_[0]->open();
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+
+  /// First collect all RIDs, then close the child scan. Deleting while an
+  /// index scanner is still active would hold its shared tree lock and
+  /// deadlock against the index's write lock.
+  while (true) {
+    Tuple *child_tuple = nullptr;
+    rc                 = children_[0]->next(child_tuple);
+    if (rc == RC::RECORD_EOF) {
+      break;
+    }
+    if (OB_FAIL(rc)) {
+      children_[0]->close();
+      return rc;
+    }
+    if (!child_tuple->has_rid) {
+      children_[0]->close();
+      LOG_ERROR("the scan tuple carries no rid, cannot delete");
+      return RC::RECORD_INVALID_RID;
+    }
+    rids_.push_back(child_tuple->rid);
+  }
+
+  RC close_rc = children_[0]->close();
+  if (OB_FAIL(close_rc)) {
+    return close_rc;
+  }
+  return RC::SUCCESS;
 }
 
 RC DeleteOperator::next(Tuple *&tuple)
@@ -53,29 +86,19 @@ RC DeleteOperator::next(Tuple *&tuple)
     return RC::RECORD_EOF;
   }
 
-  while (true) {
-    Tuple *child_tuple = nullptr;
-    RC    rc          = children_[0]->next(child_tuple);
-    if (rc == RC::RECORD_EOF) {
-      finished_ = true;
-      return RC::RECORD_EOF;
-    }
-    if (OB_FAIL(rc)) {
-      return rc;
-    }
-    if (!child_tuple->has_rid) {
-      LOG_ERROR("the scan tuple carries no rid, cannot delete");
-      return RC::RECORD_INVALID_RID;
-    }
-
-    rc = table_->delete_record(child_tuple->rid);
+  while (next_rid_index_ < rids_.size()) {
+    const RID &rid = rids_[next_rid_index_++];
+    RC         rc  = table_->delete_record(rid);
     if (OB_FAIL(rc)) {
       LOG_ERROR("failed to delete record. table=%s, rid=%s, rc=%s",
-                table_->table_name().c_str(), child_tuple->rid.to_string().c_str(), strrc(rc));
+                table_->table_name().c_str(), rid.to_string().c_str(), strrc(rc));
       return rc;
     }
     affected_rows_ += 1;
   }
+
+  finished_ = true;
+  return RC::RECORD_EOF;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,9 +110,39 @@ RC UpdateOperator::open()
   if (children_.empty()) {
     return RC::INTERNAL;
   }
-  affected_rows_ = 0;
-  finished_      = false;
-  return children_[0]->open();
+  affected_rows_  = 0;
+  finished_       = false;
+  next_rid_index_ = 0;
+  rids_.clear();
+
+  RC rc = children_[0]->open();
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+
+  while (true) {
+    Tuple *child_tuple = nullptr;
+    rc                 = children_[0]->next(child_tuple);
+    if (rc == RC::RECORD_EOF) {
+      break;
+    }
+    if (OB_FAIL(rc)) {
+      children_[0]->close();
+      return rc;
+    }
+    if (!child_tuple->has_rid) {
+      children_[0]->close();
+      LOG_ERROR("the scan tuple carries no rid, cannot update");
+      return RC::RECORD_INVALID_RID;
+    }
+    rids_.push_back(child_tuple->rid);
+  }
+
+  RC close_rc = children_[0]->close();
+  if (OB_FAIL(close_rc)) {
+    return close_rc;
+  }
+  return RC::SUCCESS;
 }
 
 RC UpdateOperator::next(Tuple *&tuple)
@@ -100,24 +153,12 @@ RC UpdateOperator::next(Tuple *&tuple)
 
   const TableMeta &meta = table_->table_meta();
 
-  while (true) {
-    Tuple *child_tuple = nullptr;
-    RC    rc          = children_[0]->next(child_tuple);
-    if (rc == RC::RECORD_EOF) {
-      finished_ = true;
-      return RC::RECORD_EOF;
-    }
-    if (OB_FAIL(rc)) {
-      return rc;
-    }
-    if (!child_tuple->has_rid) {
-      LOG_ERROR("the scan tuple carries no rid, cannot update");
-      return RC::RECORD_INVALID_RID;
-    }
+  while (next_rid_index_ < rids_.size()) {
+    const RID &rid = rids_[next_rid_index_++];
 
     /// 读出整条记录，改掉指定的列，再写回去（记录是定长的，索引由 Table 负责维护）
     Record record;
-    rc   = table_->get_record(child_tuple->rid, record);
+    RC     rc = table_->get_record(rid, record);
     if (OB_FAIL(rc)) {
       return rc;
     }
@@ -135,12 +176,15 @@ RC UpdateOperator::next(Tuple *&tuple)
       }
     }
 
-    rc = table_->update_record(child_tuple->rid, record);
+    rc = table_->update_record(rid, record);
     if (OB_FAIL(rc)) {
       LOG_ERROR("failed to update record. table=%s, rid=%s, rc=%s",
-                table_->table_name().c_str(), child_tuple->rid.to_string().c_str(), strrc(rc));
+                table_->table_name().c_str(), rid.to_string().c_str(), strrc(rc));
       return rc;
     }
     affected_rows_ += 1;
   }
+
+  finished_ = true;
+  return RC::RECORD_EOF;
 }

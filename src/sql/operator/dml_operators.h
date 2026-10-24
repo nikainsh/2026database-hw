@@ -43,6 +43,10 @@ public:
 private:
   Table *table_    = nullptr;
   bool  finished_ = false;
+  /// Materialize the write set first, then close the child scan. This avoids
+  /// holding a B+Tree scanner's shared lock while mutating the same index.
+  std::vector<RID> rids_;
+  size_t           next_rid_index_ = 0;
 };
 
 /// 更新算子：定长记录原地改写，assignments 是「列下标 -> 新值」
@@ -72,4 +76,6 @@ private:
   Table                              *table_ = nullptr;
   std::vector<std::pair<int, Value>> assignments_;
   bool                               finished_ = false;
+  std::vector<RID>                   rids_;
+  size_t                             next_rid_index_ = 0;
 };

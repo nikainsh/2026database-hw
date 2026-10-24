@@ -86,7 +86,7 @@ void PageHandle::reset()
   if (pool_ != nullptr) {
     if (access_ == PageAccess::READ) {
       pool_->unlock_frame_shared(frame_id_);
-    } else if (access_ == PageAccess::WRITE) {
+    } else {
       pool_->unlock_frame_exclusive(frame_id_);
     }
     pool_->unpin_page(frame_id_);
@@ -94,7 +94,7 @@ void PageHandle::reset()
     pool_     = nullptr;
     frame_id_ = INVALID_FRAME_ID;
     page_id_  = INVALID_PAGE_NUM;
-    access_   = PageAccess::NONE;
+    access_   = PageAccess::READ;
   }
 }
 
@@ -107,7 +107,7 @@ char *PageHandle::value() const
 RC PageHandle::mark_dirty()
 {
   ASSERT(pool_ != nullptr, "the page handle is not valid");
-  if (access_ == PageAccess::READ) {
+  if (access_ != PageAccess::WRITE) {
     return RC::BUFFERPOOL_READ_ONLY_HANDLE;
   }
   return pool_->mark_page_dirty(frame_id_);
@@ -828,7 +828,7 @@ RC DiskBufferPool::get_page(PageNum page_num, PageHandle &handle, PageAccess acc
 
     if (access == PageAccess::READ) {
       lock_frame_shared(frame_id);
-    } else if (access == PageAccess::WRITE) {
+    } else {
       lock_frame_exclusive(frame_id);
     }
 
@@ -865,7 +865,7 @@ RC DiskBufferPool::get_page(PageNum page_num, PageHandle &handle, PageAccess acc
 
   if (access == PageAccess::READ) {
     lock_frame_shared(frame_id);
-  } else if (access == PageAccess::WRITE) {
+  } else {
     lock_frame_exclusive(frame_id);
   }
 

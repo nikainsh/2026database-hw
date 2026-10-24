@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,8 @@ public:
   /// 取下一条索引项，结束返回 RC::RECORD_EOF
   RC next(std::string &key, RID &rid);
   RC restart();
+  /// Release the tree-level shared lock and the current page handle.
+  RC close();
 
 private:
   RC move_to_next_leaf();
@@ -72,6 +75,10 @@ private:
   int32_t  current_slot_ = 0;
   PageHandle handle_;
   bool       finished_ = false;
+
+  /// Held for the scanner lifetime: structural changes (insert/delete) are
+  /// excluded while a range scan is active.
+  std::shared_lock<std::shared_mutex> tree_lock_;
 };
 
 /**
@@ -142,6 +149,9 @@ private:
   int32_t lower_bound(const char *page, const char *key) const;
 
   RC find_leaf(const char *key, PageNum *leaf) const;
+  RC get_entry_locked(const char *key, std::vector<RID> &rids) const;
+  RC entry_exists_locked(const char *key, bool &exists) const;
+  RC validate_node_locked(PageNum page_num, bool is_root, std::vector<std::string> &keys) const;
   RC allocate_node_page(PageNum *page_num, bool is_leaf);
 
   // ---- 插入 ----
@@ -194,4 +204,5 @@ private:
   std::string     file_name_;
   IndexFileHeader header_;
   bool            opened_ = false;
+  mutable std::shared_mutex latch_;
 };

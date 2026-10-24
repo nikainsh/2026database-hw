@@ -90,7 +90,7 @@ int main()
     assert(OB_SUCC(pool->dispose_page(1)));
     assert(pool->dispose_page(1) == RC::BUFFERPOOL_DOUBLE_FREE);
     PageHandle handle;
-    assert(pool->get_page(1, handle) == RC::BUFFERPOOL_PAGE_FREED);
+    assert(pool->get_page_read(1, handle) == RC::BUFFERPOOL_PAGE_FREED);
     PageNum reused = INVALID_PAGE_NUM;
     assert(OB_SUCC(pool->allocate_page(&reused)));
     assert(reused == 1);

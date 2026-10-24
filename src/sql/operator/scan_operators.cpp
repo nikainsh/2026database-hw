@@ -101,8 +101,9 @@ RC IndexScanOperator::open()
 
 RC IndexScanOperator::close()
 {
-  scanner_.restart();
-  return RC::SUCCESS;
+  /// Release the tree-level shared lock before returning. The next open()
+  /// will re-initialize the scanner.
+  return scanner_.close();
 }
 
 RC IndexScanOperator::fill_tuple(const Record &record)

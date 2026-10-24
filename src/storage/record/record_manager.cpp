@@ -72,7 +72,7 @@ RC HeapRecordManager::read_header(RecordFileHeader &header)
   }
 
   PageHandle handle;
-  RC         rc = buffer_pool_->get_page(RECORD_META_PAGE, handle);
+  RC         rc = buffer_pool_->get_page_read(RECORD_META_PAGE, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -83,7 +83,7 @@ RC HeapRecordManager::read_header(RecordFileHeader &header)
 RC HeapRecordManager::write_header(const RecordFileHeader &header)
 {
   PageHandle handle;
-  RC         rc = buffer_pool_->get_page(RECORD_META_PAGE, handle);
+  RC         rc = buffer_pool_->get_page_write(RECORD_META_PAGE, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -124,7 +124,7 @@ RC HeapRecordManager::insert_record(Record &record)
     }
 
     PageHandle          handle;
-    rc = buffer_pool_->get_page(page_num, handle);
+    rc = buffer_pool_->get_page_write(page_num, handle);
     if (OB_FAIL(rc)) {
       return rc;
     }
@@ -164,6 +164,7 @@ RC HeapRecordManager::insert_record(Record &record)
 
       file_header.record_count += 1;
       file_header.last_insert_page = page_num;
+      handle.reset();
       return write_header(file_header);
     }
 
@@ -197,7 +198,7 @@ RC HeapRecordManager::delete_record(const RID &rid)
   }
 
   PageHandle handle;
-  RC         rc = buffer_pool_->get_page(rid.page_num, handle);
+  RC         rc = buffer_pool_->get_page_write(rid.page_num, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -216,6 +217,7 @@ RC HeapRecordManager::delete_record(const RID &rid)
   *slot = -1;
   header->deleted_count += 1;
   handle.mark_dirty();
+  handle.reset();
 
   RecordFileHeader file_header;
   rc                = read_header(file_header);
@@ -238,7 +240,7 @@ RC HeapRecordManager::get_record(const RID &rid, Record &record)
   }
 
   PageHandle handle;
-  RC         rc = buffer_pool_->get_page(rid.page_num, handle);
+  RC         rc = buffer_pool_->get_page_read(rid.page_num, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -271,7 +273,7 @@ RC HeapRecordManager::update_record(const RID &rid, const Record &record)
   }
 
   PageHandle handle;
-  RC         rc = buffer_pool_->get_page(rid.page_num, handle);
+  RC         rc = buffer_pool_->get_page_write(rid.page_num, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }

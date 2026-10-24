@@ -84,6 +84,7 @@ BplusTree::~BplusTree() { close(); }
 
 RC BplusTree::open(DiskBufferPool *buffer_pool, AttrType key_type, int key_len, bool unique, bool create)
 {
+  std::unique_lock<std::shared_mutex> tree_guard(latch_);
   if (buffer_pool == nullptr || key_len <= 0 || key_len > BP_PAGE_SIZE / 4) {
     return RC::INVALID_ARGUMENT;
   }
@@ -119,7 +120,7 @@ RC BplusTree::open(DiskBufferPool *buffer_pool, AttrType key_type, int key_len, 
     header.first_leaf_page = root;
 
     PageHandle handle;
-    rc = buffer_pool_->get_page(root, handle);
+    rc = buffer_pool_->get_page_write(root, handle);
     if (OB_FAIL(rc)) {
       return rc;
     }
@@ -149,6 +150,7 @@ RC BplusTree::open(DiskBufferPool *buffer_pool, AttrType key_type, int key_len, 
 
 RC BplusTree::close()
 {
+  std::unique_lock<std::shared_mutex> tree_guard(latch_);
   opened_      = false;
   buffer_pool_ = nullptr;
   return RC::SUCCESS;
@@ -160,7 +162,7 @@ RC BplusTree::read_header()
     return RC::RECORD_OPENNED;
   }
   PageHandle handle;
-  RC         rc = buffer_pool_->get_page(INDEX_HEADER_PAGE, handle);
+  RC         rc = buffer_pool_->get_page_read(INDEX_HEADER_PAGE, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -173,7 +175,7 @@ RC BplusTree::read_header()
 RC BplusTree::write_header()
 {
   PageHandle handle;
-  RC         rc = buffer_pool_->get_page(INDEX_HEADER_PAGE, handle);
+  RC         rc = buffer_pool_->get_page_write(INDEX_HEADER_PAGE, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -200,7 +202,7 @@ RC BplusTree::allocate_node_page(PageNum *page_num, bool is_leaf)
   }
 
   PageHandle handle;
-  rc        = buffer_pool_->get_page(*page_num, handle);
+  rc        = buffer_pool_->get_page_write(*page_num, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -294,7 +296,7 @@ RC BplusTree::find_leaf(const char *key, PageNum *leaf) const
 
   while (true) {
     PageHandle handle;
-    RC         rc = buffer_pool_->get_page(page_num, handle);
+    RC         rc = buffer_pool_->get_page_read(page_num, handle);
     if (OB_FAIL(rc)) {
       return rc;
     }
@@ -310,7 +312,7 @@ RC BplusTree::find_leaf(const char *key, PageNum *leaf) const
 RC BplusTree::update_leaf_link(PageNum page, PageNum next_leaf) const
 {
   PageHandle handle;
-  RC         rc = buffer_pool_->get_page(page, handle);
+  RC         rc = buffer_pool_->get_page_write(page, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -324,13 +326,14 @@ RC BplusTree::update_leaf_link(PageNum page, PageNum next_leaf) const
 
 RC BplusTree::insert_entry(const char *key, const RID &rid)
 {
+  std::unique_lock<std::shared_mutex> tree_guard(latch_);
   if (!opened_ || buffer_pool_ == nullptr) {
     return RC::RECORD_OPENNED;
   }
 
   if (unique()) {
     bool exists = false;
-    RC   rc     = entry_exists(key, exists);
+    RC   rc     = entry_exists_locked(key, exists);
     if (OB_FAIL(rc)) {
       return rc;
     }
@@ -363,18 +366,20 @@ RC BplusTree::insert_entry(const char *key, const RID &rid)
 RC BplusTree::insert_recursive(PageNum page, const char *key, const char *value, SplitInfo *info)
 {
   PageHandle handle;
-  RC         rc = buffer_pool_->get_page(page, handle);
+  RC         rc = buffer_pool_->get_page_read(page, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
 
   if (is_leaf_page(handle.value())) {
+    handle.reset();
     return insert_into_leaf(page, key, value, info);
   }
 
-  char     *node     = handle.value();
+  const char   *node  = handle.value();
   const int32_t index = upper_bound(node, key);
   const PageNum child = child_at(node, index);
+  handle.reset();
 
   SplitInfo child_info;
   rc = insert_recursive(child, key, value, &child_info);
@@ -392,7 +397,7 @@ RC BplusTree::insert_recursive(PageNum page, const char *key, const char *value,
 RC BplusTree::insert_into_leaf(PageNum page, const char *key, const char *value, SplitInfo *info)
 {
   PageHandle handle;
-  RC         rc = buffer_pool_->get_page(page, handle);
+  RC         rc = buffer_pool_->get_page_write(page, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -442,7 +447,7 @@ RC BplusTree::insert_into_leaf(PageNum page, const char *key, const char *value,
   /// 右叶子继承原来的后继，并把双向链补好
   const PageNum old_next = header->next_leaf;
   PageHandle    right_handle;
-  rc = buffer_pool_->get_page(right_page, right_handle);
+  rc = buffer_pool_->get_page_write(right_page, right_handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -457,7 +462,7 @@ RC BplusTree::insert_into_leaf(PageNum page, const char *key, const char *value,
 
   if (old_next != INVALID_PAGE_NUM) {
     PageHandle next_handle;
-    rc = buffer_pool_->get_page(old_next, next_handle);
+    rc = buffer_pool_->get_page_write(old_next, next_handle);
     if (OB_FAIL(rc)) {
       return rc;
     }
@@ -481,7 +486,7 @@ RC BplusTree::insert_into_leaf(PageNum page, const char *key, const char *value,
 RC BplusTree::insert_into_internal(PageNum page, const char *key, PageNum child, SplitInfo *info)
 {
   PageHandle      handle;
-  RC              rc = buffer_pool_->get_page(page, handle);
+  RC              rc = buffer_pool_->get_page_write(page, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -540,7 +545,7 @@ RC BplusTree::insert_into_internal(PageNum page, const char *key, PageNum child,
   }
 
   PageHandle right_handle;
-  rc = buffer_pool_->get_page(right_page, right_handle);
+  rc = buffer_pool_->get_page_write(right_page, right_handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -577,7 +582,7 @@ RC BplusTree::grow_root(const std::string &key, PageNum left, PageNum right)
   }
 
   PageHandle handle;
-  rc        = buffer_pool_->get_page(root, handle);
+  rc        = buffer_pool_->get_page_write(root, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -602,6 +607,12 @@ RC BplusTree::grow_root(const std::string &key, PageNum left, PageNum right)
 
 RC BplusTree::get_entry(const char *key, std::vector<RID> &rids) const
 {
+  std::shared_lock<std::shared_mutex> tree_guard(latch_);
+  return get_entry_locked(key, rids);
+}
+
+RC BplusTree::get_entry_locked(const char *key, std::vector<RID> &rids) const
+{
   rids.clear();
   if (!opened_) {
     return RC::RECORD_OPENNED;
@@ -617,7 +628,7 @@ RC BplusTree::get_entry(const char *key, std::vector<RID> &rids) const
   PageNum page = leaf;
   while (page != INVALID_PAGE_NUM) {
     PageHandle handle;
-    rc        = buffer_pool_->get_page(page, handle);
+    rc        = buffer_pool_->get_page_read(page, handle);
     if (OB_FAIL(rc)) {
       return rc;
     }
@@ -651,8 +662,14 @@ RC BplusTree::get_entry(const char *key, std::vector<RID> &rids) const
 
 RC BplusTree::entry_exists(const char *key, bool &exists) const
 {
+  std::shared_lock<std::shared_mutex> tree_guard(latch_);
+  return entry_exists_locked(key, exists);
+}
+
+RC BplusTree::entry_exists_locked(const char *key, bool &exists) const
+{
   std::vector<RID> rids;
-  RC               rc = get_entry(key, rids);
+  RC               rc = get_entry_locked(key, rids);
   exists              = !rids.empty();
   return rc;
 }
@@ -663,6 +680,7 @@ RC BplusTree::entry_exists(const char *key, bool &exists) const
 
 RC BplusTree::delete_entry(const char *key, const RID &rid)
 {
+  std::unique_lock<std::shared_mutex> tree_guard(latch_);
   if (!opened_) {
     return RC::RECORD_OPENNED;
   }
@@ -739,7 +757,7 @@ RC BplusTree::locate_entry(PageNum leaf, const char *key, const char *value,
   PageNum current = leaf;
   while (current != INVALID_PAGE_NUM) {
     PageHandle handle;
-    RC         rc = buffer_pool_->get_page(current, handle);
+    RC         rc = buffer_pool_->get_page_read(current, handle);
     if (OB_FAIL(rc)) {
       return rc;
     }
@@ -775,31 +793,41 @@ RC BplusTree::locate_entry(PageNum leaf, const char *key, const char *value,
 RC BplusTree::find_path(PageNum page, PageNum target_leaf, std::vector<PathStep> &path)
 {
   PageHandle handle;
-  RC         rc = buffer_pool_->get_page(page, handle);
+  RC         rc = buffer_pool_->get_page_read(page, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
 
-  const char *node = handle.const_data();
-  if (is_leaf_page(node)) {
+  if (is_leaf_page(handle.const_data())) {
     return RC::NOTFOUND;
   }
 
-  const int32_t count = node_key_count(node);
+  const int32_t count = node_key_count(handle.const_data());
+  std::vector<PageNum> children;
+  children.reserve(static_cast<size_t>(count) + 1);
   for (int32_t i = 0; i <= count; ++i) {
-    const PageNum child = child_at(node, i);
+    children.push_back(child_at(handle.const_data(), i));
+  }
+  handle.reset();
+
+  /// Release the parent latch before recursing: the recursive call re-opens
+  /// the child page, and page latches are deliberately non-recursive.
+  for (int32_t i = 0; i <= count; ++i) {
+    const PageNum child = children[static_cast<size_t>(i)];
     if (child == target_leaf) {
       path.push_back(PathStep{page, i});
       return RC::SUCCESS;
     }
 
     PageHandle child_handle;
-    rc = buffer_pool_->get_page(child, child_handle);
+    rc = buffer_pool_->get_page_read(child, child_handle);
     if (OB_FAIL(rc)) {
       return rc;
     }
-    if (is_leaf_page(child_handle.const_data())) {
-      continue;  /// 是叶子但不是目标叶子
+    const bool child_is_leaf = is_leaf_page(child_handle.const_data());
+    child_handle.reset();
+    if (child_is_leaf) {
+      continue;
     }
 
     path.push_back(PathStep{page, i});
@@ -816,7 +844,7 @@ RC BplusTree::find_path(PageNum page, PageNum target_leaf, std::vector<PathStep>
 RC BplusTree::erase_from_leaf(PageNum page, int32_t slot, int32_t *num_key_after)
 {
   PageHandle handle;
-  RC         rc = buffer_pool_->get_page(page, handle);
+  RC         rc = buffer_pool_->get_page_write(page, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -841,16 +869,16 @@ RC BplusTree::erase_from_leaf(PageNum page, int32_t slot, int32_t *num_key_after
 RC BplusTree::fix_underflow(PageNum parent, int32_t child_index, DeleteInfo *parent_info)
 {
   PageHandle parent_handle;
-  RC         rc = buffer_pool_->get_page(parent, parent_handle);
+  RC         rc = buffer_pool_->get_page_read(parent, parent_handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
 
-  char            *node   = parent_handle.value();
-  const int32_t    count  = node_key_count(node);
-  const bool       has_left  = child_index > 0;
+  const char    *node   = parent_handle.const_data();
+  const int32_t  count  = node_key_count(node);
+  const bool     has_left  = child_index > 0;
   /// 孩子总数 = 键数 + 1，下标范围 0..count，所以右兄弟存在当且仅当 child_index < count
-  const bool       has_right = child_index < count;
+  const bool     has_right = child_index < count;
 
   LOG_DBG("fix underflow: parent=%d child_index=%d keys=%d min=%d leaf=%d",
           parent, child_index, count, header_.min_keys, is_leaf_page(node) ? 1 : 0);
@@ -858,11 +886,14 @@ RC BplusTree::fix_underflow(PageNum parent, int32_t child_index, DeleteInfo *par
   if (has_left) {
     const PageNum left = child_at(node, child_index - 1);
     PageHandle    left_handle;
-    rc = buffer_pool_->get_page(left, left_handle);
+    rc = buffer_pool_->get_page_read(left, left_handle);
     if (OB_FAIL(rc)) {
       return rc;
     }
-    if (node_key_count(left_handle.const_data()) > header_.min_keys) {
+    const bool can_borrow = node_key_count(left_handle.const_data()) > header_.min_keys;
+    left_handle.reset();
+    if (can_borrow) {
+      parent_handle.reset();
       return move_key_to_left(parent, child_index);
     }
   }
@@ -870,15 +901,19 @@ RC BplusTree::fix_underflow(PageNum parent, int32_t child_index, DeleteInfo *par
   if (has_right) {
     const PageNum right = child_at(node, child_index + 1);
     PageHandle    right_handle;
-    rc = buffer_pool_->get_page(right, right_handle);
+    rc = buffer_pool_->get_page_read(right, right_handle);
     if (OB_FAIL(rc)) {
       return rc;
     }
-    if (node_key_count(right_handle.const_data()) > header_.min_keys) {
+    const bool can_borrow = node_key_count(right_handle.const_data()) > header_.min_keys;
+    right_handle.reset();
+    if (can_borrow) {
+      parent_handle.reset();
       return move_key_to_right(parent, child_index);
     }
   }
 
+  parent_handle.reset();
   if (has_left) {
     return merge_nodes(parent, child_index, true, parent_info);
   }
@@ -894,7 +929,7 @@ RC BplusTree::fix_underflow(PageNum parent, int32_t child_index, DeleteInfo *par
 RC BplusTree::move_key_to_left(PageNum parent, int32_t child_index)
 {
   PageHandle parent_handle;
-  RC         rc = buffer_pool_->get_page(parent, parent_handle);
+  RC         rc = buffer_pool_->get_page_write(parent, parent_handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -904,11 +939,11 @@ RC BplusTree::move_key_to_left(PageNum parent, int32_t child_index)
   const PageNum child = child_at(parent_node, child_index);
 
   PageHandle left_handle, child_handle;
-  rc = buffer_pool_->get_page(left, left_handle);
+  rc = buffer_pool_->get_page_write(left, left_handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
-  rc = buffer_pool_->get_page(child, child_handle);
+  rc = buffer_pool_->get_page_write(child, child_handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -956,7 +991,7 @@ RC BplusTree::move_key_to_left(PageNum parent, int32_t child_index)
 RC BplusTree::move_key_to_right(PageNum parent, int32_t child_index)
 {
   PageHandle parent_handle;
-  RC         rc = buffer_pool_->get_page(parent, parent_handle);
+  RC         rc = buffer_pool_->get_page_write(parent, parent_handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -966,11 +1001,11 @@ RC BplusTree::move_key_to_right(PageNum parent, int32_t child_index)
   const PageNum right  = child_at(parent_node, child_index + 1);
 
   PageHandle child_handle, right_handle;
-  rc = buffer_pool_->get_page(child, child_handle);
+  rc = buffer_pool_->get_page_write(child, child_handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
-  rc = buffer_pool_->get_page(right, right_handle);
+  rc = buffer_pool_->get_page_write(right, right_handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -1016,7 +1051,7 @@ RC BplusTree::move_key_to_right(PageNum parent, int32_t child_index)
 RC BplusTree::merge_nodes(PageNum parent, int32_t child_index, bool with_left, DeleteInfo *parent_info)
 {
   PageHandle parent_handle;
-  RC         rc = buffer_pool_->get_page(parent, parent_handle);
+  RC         rc = buffer_pool_->get_page_write(parent, parent_handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -1028,11 +1063,11 @@ RC BplusTree::merge_nodes(PageNum parent, int32_t child_index, bool with_left, D
   const PageNum give_up     = child_at(parent_node, key_index + 1);
 
   PageHandle keep_handle, give_handle;
-  rc = buffer_pool_->get_page(keep, keep_handle);
+  rc = buffer_pool_->get_page_write(keep, keep_handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
-  rc = buffer_pool_->get_page(give_up, give_handle);
+  rc = buffer_pool_->get_page_write(give_up, give_handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -1056,7 +1091,7 @@ RC BplusTree::merge_nodes(PageNum parent, int32_t child_index, bool with_left, D
     keep_hdr->next_leaf = give_hdr->next_leaf;
     if (give_hdr->next_leaf != INVALID_PAGE_NUM) {
       PageHandle next_handle;
-      rc = buffer_pool_->get_page(give_hdr->next_leaf, next_handle);
+      rc = buffer_pool_->get_page_write(give_hdr->next_leaf, next_handle);
       if (OB_FAIL(rc)) {
         return rc;
       }
@@ -1105,7 +1140,7 @@ RC BplusTree::merge_nodes(PageNum parent, int32_t child_index, bool with_left, D
 RC BplusTree::shrink_root()
 {
   PageHandle handle;
-  RC         rc = buffer_pool_->get_page(header_.root_page, handle);
+  RC         rc = buffer_pool_->get_page_write(header_.root_page, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -1137,9 +1172,6 @@ RC BplusTree::make_scanner(BplusTreeScanner &scanner,
                            const char *left_key, bool left_inclusive,
                            const char *right_key, bool right_inclusive) const
 {
-  if (!opened_) {
-    return RC::RECORD_OPENNED;
-  }
   return scanner.init(const_cast<BplusTree *>(this),
                       left_key, left_inclusive, right_key, right_inclusive);
 }
@@ -1152,7 +1184,12 @@ RC BplusTreeScanner::init(BplusTree *tree,
     return RC::INVALID_ARGUMENT;
   }
 
-  tree_             = tree;
+  tree_      = tree;
+  tree_lock_ = std::shared_lock<std::shared_mutex>(tree_->latch_);
+  if (!tree_->opened_) {
+    return RC::RECORD_OPENNED;
+  }
+
   left_inclusive_   = left_inclusive;
   right_inclusive_  = right_inclusive;
   finished_         = false;
@@ -1195,6 +1232,17 @@ RC BplusTreeScanner::restart()
   return RC::SUCCESS;
 }
 
+RC BplusTreeScanner::close()
+{
+  handle_.reset();
+  tree_lock_    = std::shared_lock<std::shared_mutex>();
+  tree_         = nullptr;
+  current_page_ = INVALID_PAGE_NUM;
+  current_slot_ = 0;
+  finished_     = true;
+  return RC::SUCCESS;
+}
+
 RC BplusTreeScanner::next(std::string &key, RID &rid)
 {
   while (!finished_) {
@@ -1203,7 +1251,7 @@ RC BplusTreeScanner::next(std::string &key, RID &rid)
         finished_ = true;
         break;
       }
-      RC rc = tree_->buffer_pool_->get_page(current_page_, handle_);
+      RC rc = tree_->buffer_pool_->get_page_read(current_page_, handle_);
       if (OB_FAIL(rc)) {
         return rc;
       }
@@ -1258,10 +1306,21 @@ RC BplusTreeScanner::move_to_next_leaf()
   handle_.reset();
   current_page_ = next;
   current_slot_ = 0;
+  if (next != INVALID_PAGE_NUM) {
+    /// Leaf pages are linked in scan order; warm the next leaf before the
+    /// next get_page_read() call.
+    tree_->buffer_pool_->prefetch_page(next);
+  }
   return RC::SUCCESS;
 }
 
 RC BplusTree::validate_node(PageNum page_num, bool is_root, std::vector<std::string> &keys) const
+{
+  std::shared_lock<std::shared_mutex> tree_guard(latch_);
+  return validate_node_locked(page_num, is_root, keys);
+}
+
+RC BplusTree::validate_node_locked(PageNum page_num, bool is_root, std::vector<std::string> &keys) const
 {
   if (page_num < INDEX_FIRST_NODE_PAGE || page_num >= buffer_pool_->page_count()) {
     LOG_ERROR("child pointer out of range. file=%s, page=%s",
@@ -1270,7 +1329,7 @@ RC BplusTree::validate_node(PageNum page_num, bool is_root, std::vector<std::str
   }
 
   PageHandle handle;
-  RC         rc = buffer_pool_->get_page(page_num, handle);
+  RC         rc = buffer_pool_->get_page_read(page_num, handle);
   if (OB_FAIL(rc)) {
     LOG_ERROR("failed to read node page. file=%s, page=%s, rc=%s",
               file_name_.c_str(), std::to_string(page_num).c_str(), strrc(rc));
@@ -1306,7 +1365,7 @@ RC BplusTree::validate_node(PageNum page_num, bool is_root, std::vector<std::str
   }
 
   for (int32_t i = 0; i <= count; ++i) {
-    rc = validate_node(child_at(node, i), false, keys);
+    rc = validate_node_locked(child_at(node, i), false, keys);
     if (OB_FAIL(rc)) {
       return rc;
     }
@@ -1316,6 +1375,7 @@ RC BplusTree::validate_node(PageNum page_num, bool is_root, std::vector<std::str
 
 RC BplusTree::validate(std::vector<std::string> *keys_out) const
 {
+  std::shared_lock<std::shared_mutex> tree_guard(latch_);
   std::vector<std::string> keys;
   if (keys_out != nullptr) {
     keys_out->clear();
@@ -1328,7 +1388,7 @@ RC BplusTree::validate(std::vector<std::string> *keys_out) const
   bool        has_prev = false;
   while (page_num != INVALID_PAGE_NUM) {
     PageHandle handle;
-    RC         rc = buffer_pool_->get_page(page_num, handle);
+    RC         rc = buffer_pool_->get_page_read(page_num, handle);
     if (OB_FAIL(rc)) {
       return rc;
     }
@@ -1359,7 +1419,7 @@ RC BplusTree::validate(std::vector<std::string> *keys_out) const
     const PageNum next = page_header(handle.const_data())->next_leaf;
     if (next != INVALID_PAGE_NUM) {
       PageHandle next_handle;
-      rc = buffer_pool_->get_page(next, next_handle);
+      rc = buffer_pool_->get_page_read(next, next_handle);
       if (OB_FAIL(rc)) {
         return rc;
       }
@@ -1379,7 +1439,7 @@ RC BplusTree::validate(std::vector<std::string> *keys_out) const
 
   /// 2) 自顶向下再走一遍：路径上的键序列必须与叶子链完全一致
   std::vector<std::string> from_root;
-  RC                       rc = validate_node(header_.root_page, true, from_root);
+  RC                       rc = validate_node_locked(header_.root_page, true, from_root);
   if (OB_FAIL(rc)) {
     return rc;
   }
