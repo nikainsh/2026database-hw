@@ -18,8 +18,8 @@ list(FILTER MINIDB_LIB_SRC EXCLUDE REGEX "main\\.cpp$")
 add_executable(minidb src/shell/main.cpp ${MINIDB_LIB_SRC})
 
 if(MINGW OR WIN32)
-  target_compile_definitions(minidb PRIVATE __USE_MINGW_ANSI_STDIO=1)
-  target_link_libraries(minidb PRIVATE -static -static-libgcc -static-libstdc++)
+  add_compile_definitions(__USE_MINGW_ANSI_STDIO=1)
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libgcc -static-libstdc++")
 endif()
 
 # 单元测试：tests/test_*.cpp 每个都是独立的可执行文件
@@ -28,5 +28,7 @@ enable_testing()
 foreach(test_src ${MINIDB_TESTS})
   get_filename_component(test_name ${test_src} NAME_WE)
   add_executable(${test_name} ${test_src} ${MINIDB_LIB_SRC})
+  # Keep assertions active even in Release builds.
+  target_compile_options(${test_name} PRIVATE -UNDEBUG)
   add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()

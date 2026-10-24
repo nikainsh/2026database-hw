@@ -99,7 +99,7 @@ build_tests() {
   done
 
   echo "==> running tests"
-  rm -rf _test_tmp _test_buf _test_record _test_index _test_db
+  rm -rf _test_tmp _test_buf _test_wal _test_record _test_index _test_db
   for t in $(ls tests/test_*.cpp 2>/dev/null); do
     name=$(basename "$t" .cpp)
     "${BINDIR}/$name$EXE"
@@ -109,7 +109,7 @@ build_tests() {
 case "${1:-all}" in
   all) build_main ;;
   test | tests) build_tests ;;
-  clean) rm -rf build _test_tmp _test_buf _test_record _test_index _test_db e2e_data smoke repl_data data demo_data ;;
+  clean) rm -rf build _test_tmp _test_buf _test_wal _test_record _test_index _test_db e2e_data smoke repl_data data demo_data ;;
   rebuild) rm -rf build; mkdir -p "$BINDIR" "$OBJDIR"; build_main ;;
   *) echo "usage: $0 [all|test|clean|rebuild]"; exit 1 ;;
 esac

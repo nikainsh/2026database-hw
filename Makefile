@@ -70,7 +70,7 @@ DEPS := $(LIB_OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_DEPS)
 -include $(DEPS)
 
 unit: $(TEST_BINS)
-	@rm -rf _test_tmp _test_buf _test_record _test_index _test_db
+	@rm -rf _test_tmp _test_buf _test_wal _test_record _test_index _test_db
 	@for t in $(TEST_BINS); do $$t || exit 1; done
 	@echo "unit tests: OK"
 
@@ -80,6 +80,6 @@ e2e: $(MAIN_BIN)
 test: unit e2e
 
 clean:
-	rm -rf build _test_tmp _test_buf _test_record _test_index _test_db e2e_data smoke repl_data data demo_data
+	rm -rf build _test_tmp _test_buf _test_wal _test_record _test_index _test_db e2e_data smoke repl_data data demo_data
 
 rebuild: clean all
