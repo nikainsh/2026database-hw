@@ -54,6 +54,21 @@ expect_ok() {  # expect_ok <描述> <sql>
   fi
 }
 
+## 断言某个 count(*) 查询返回的确切数值（比子串 grep 强，用来守正确性回归）
+expect_count() {  # expect_count <描述> <sql> <期望值>
+  local what="$1" sql="$2" want="$3"
+  local got
+  got=$(run -e "$sql" | awk '/^[[:space:]]*[0-9]+[[:space:]]*\|/ {gsub(/[^0-9]/, "", $0); print; exit}')
+  if [ "$got" = "$want" ]; then
+    echo "  PASS  $what (= $want)"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL  $what  期望 $want 实际 '${got:-无输出}'"
+    run -e "$sql" | sed 's/^/    /'
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 rm -rf "$DATA"
 echo "== 1) 跑完整示例脚本 tests/demo.sql =="
 demo_output=$(timeout 120 $BIN --data "$DATA" --db e2e -f tests/demo.sql 2>&1)
@@ -89,6 +104,28 @@ else
 fi
 reopened=$(run -e 'show tables')
 check "重启后表还在" "student" "$reopened"
+
+echo "== 2b) 索引选择/扫描的正确性回归（A1、B1）=="
+expect_count "非唯一索引跨叶子重复键全部返回" "select count(*) from dupcheck where k = 'same'" 12
+expect_count "两个索引列各带范围条件时键范围不跨列串用" "select count(*) from twocol where id > 2 and cat < 4" 5
+
+echo "== 2c) count(*) 走表头计数的正确性回归（P0）=="
+expect_count "无条件 count(*) = 表头记录数" "select count(*) from dupcheck" 14
+expect_count "建过索引后 count(*) 仍准确" "select count(*) from twocol" 8
+expect_count "带条件时不能短路成全表行数" "select count(*) from twocol where id > 2" 5
+expect_count "删过行之后 count(*) 仍准确" "select count(*) from student" 2
+
+
+echo "== 2d) 连接条件与索引嵌套循环连接的正确性回归（P1b）=="
+expect_count "无索引时连接行数" "select count(*) from join_small, join_big where join_small.k = join_big.k" 7
+expect_count "无索引时连接命中的 id 之和" "select sum(join_big.id) from join_small, join_big where join_small.k = join_big.k" 29
+expect_count "连接列建索引后行数不变" "select count(*) from join_small, join_big where join_small.k = join_big.k" 7
+expect_count "连接列建索引后 id 之和不变" "select sum(join_big.id) from join_small, join_big where join_small.k = join_big.k" 29
+expect_count "FROM 顺序反过来仍是同一批行" "select count(*) from join_big, join_small where join_big.k = join_small.k" 7
+expect_count "连接条件与单表条件同时成立" "select count(*) from join_small, join_big where join_small.k = join_big.k and join_big.id > 2" 5
+expect_count "没有连接条件时是笛卡尔积" "select count(*) from join_small, join_big" 32
+check "explain 里连接走索引查找" "join_lookup" "$(run -e 'explain select count(*) from join_small, join_big where join_small.k = join_big.k')"
+check "explain 把连接条件挂在 join 上" "on=join_small.k = join_big.k" "$(run -e 'explain select count(*) from join_small, join_big where join_small.k = join_big.k')"
 
 echo "== 3) 索引内容与表内容保持一致 =="
 after_delete=$(run -e 'select name from student where age = 20')

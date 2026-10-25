@@ -93,7 +93,8 @@ struct JoinFixture
 {
   NestedLoopJoinOperator join;
   RowsOperator *left, *right;
-  JoinFixture(std::vector<int> l, std::vector<int> r, Expression *condition = nullptr) : join(condition)
+  JoinFixture(std::vector<int> l, std::vector<int> r, Expression *condition = nullptr)
+      : join(condition == nullptr ? std::vector<Expression *>() : std::vector<Expression *>{condition})
   {
     auto a = std::make_unique<RowsOperator>(std::move(l), 0);
     auto b = std::make_unique<RowsOperator>(std::move(r), 1);
@@ -215,7 +216,7 @@ static void test_two_close_errors()
 
 static void test_unopened_index_input()
 {
-  NestedLoopJoinOperator join(nullptr);
+  NestedLoopJoinOperator join(std::vector<Expression *>{});
   join.add_child(std::make_unique<RowsOperator>(std::vector<int>{}, 0));
   // Empty left means this real IndexScanOperator must never be opened or closed.
   // Null dependencies deliberately detect any attempt to touch the unused side.
@@ -228,9 +229,9 @@ static void test_unopened_index_input()
 
 static void test_nested_join()
 {
-  NestedLoopJoinOperator outer(nullptr);
+  NestedLoopJoinOperator outer(std::vector<Expression *>{});
   // Use a separate inner tree owned by the outer join, exercising recursive close.
-  auto nested = std::make_unique<NestedLoopJoinOperator>(nullptr);
+  auto nested = std::make_unique<NestedLoopJoinOperator>(std::vector<Expression *>{});
   auto a = std::make_unique<RowsOperator>(std::vector<int>{1, 2}, 0);
   auto b = std::make_unique<RowsOperator>(std::vector<int>{3}, 1);
   auto c = std::make_unique<RowsOperator>(std::vector<int>{4, 5}, 2);
