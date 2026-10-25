@@ -40,12 +40,15 @@ public:
   void prefetch(DiskBufferPool *owner, PageNum page);
   /// Stop accepting prefetches for `owner` and wait for in-flight prefetches.
   void cancel_owner(DiskBufferPool *owner);
+  /// Cancel/await an in-flight prefetch for one page before dispose/reuse.
+  void cancel_prefetch(DiskBufferPool *owner, PageNum page);
   /// Stop the background worker. Idempotent.
   void stop();
   RC remove_page(DiskBufferPool *owner, PageNum page);
   RC flush_page(DiskBufferPool *owner, PageNum page);
   RC flush_owner(DiskBufferPool *owner);
   RC remove_owner(DiskBufferPool *owner);
+  void resume_owner(DiskBufferPool *owner);
   bool has_dirty(DiskBufferPool *owner) const;
 
   RC   unpin(FrameId frame_id, bool background = false);
@@ -88,6 +91,7 @@ private:
 
   std::deque<PrefetchRequest>        prefetch_queue_;
   std::unordered_set<uint64_t>       prefetch_pending_;
+  std::unordered_set<uint64_t>       prefetch_active_;
   std::unordered_map<DiskBufferPool *, int> owner_active_ops_;
   std::unordered_set<DiskBufferPool *>      closing_owners_;
   std::atomic<int>                    background_pins_{0};

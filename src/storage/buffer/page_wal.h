@@ -44,6 +44,10 @@ public:
   /// Append a full page image and fsync the WAL before returning.
   RC append_and_sync(PageNum page_num, const char *data);
 
+  /// Append two page images as one atomic WAL record and fsync before returning.
+  RC append_two_pages_and_sync(PageNum page_a, const char *data_a,
+                               PageNum page_b, const char *data_b);
+
   /// Truncate the WAL. Caller must have fsync'ed the data file first.
   RC checkpoint();
 

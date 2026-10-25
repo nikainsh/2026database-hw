@@ -195,6 +195,8 @@ private:
   RC read_page_raw(PageNum page_num, char *data);
   RC write_page_raw(PageNum page_num, const char *data);
   RC write_page_with_wal(PageNum page_num, const char *data);
+  RC write_two_pages_with_wal(PageNum page_a, const char *data_a,
+                              PageNum page_b, const char *data_b);
   RC seek(int64_t offset);
   RC sync_data_file();
 

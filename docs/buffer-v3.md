@@ -54,7 +54,9 @@ Frame latch 在拿到 frame_id 之后单独获取，不和上面几把锁同时�
 - `meta_mutex_` 保护文件 header、free list、closing 状态。
 - `FrameManager::mutex_` 保护全局页表、frame 元数据、owner 配额、LRU-K。
 - `flush_mutex_` 串行化“WAL append + 数据页写”和 checkpoint，避免 checkpoint 在 append 与 data write 之间截断 WAL。
-- 页 miss 目前仍持 `FrameManager::mutex_` 做 I/O；这是 Phase 1 的已知性能限制，Phase 2 会改成 per-page in-flight I/O。
+- 页 miss 会先在全局页表中插入 `loading` frame，然后释放 `FrameManager::mutex_` 做磁盘读；
+- 同一页的并发 miss 通过条件变量等待，只发一次 I/O；
+- 不同文件可以并行缺页；同一个 `DiskBufferPool` 的 `get_page` 仍持 `meta_mutex_`，因此单文件内缺页串行。
 
 ---
 
@@ -74,14 +76,13 @@ Frame latch 在拿到 frame_id 之后单独获取，不和上面几把锁同时�
 
 ---
 
-## 5. 当前限制（Phase 2 处理）
+## 5. 当前并发与耐久性边界
 
-- 页 miss 仍持全局 `FrameManager::mutex_`，不同文件的缺页不能并行。
-- 预取仍是同步预热。
-- 刷脏仍是同步的，没有 page cleaner 线程。
-- WAL 仍是 full-page redo，没有 doublewrite / 数据页 checksum。
-
-这些会在 v3 后续阶段继续处理。
+- 同一个 `DiskBufferPool` 的缺页仍由 `meta_mutex_` 串行化；跨文件缺页可以并行。
+- 预取 worker 是单线程；预取是 best-effort，不保证调用返回时页已驻留。
+- 后台刷脏每 50ms 最多处理 4 页，不做后台 checkpoint，也没有 group commit。
+- WAL 仍是页级 full-page redo；尚未启用 doublewrite / 数据页 checksum。
+- `flush_page` / `flush_all_buffers` 会与页写入串行化；调用方仍应避免在持有写句柄时关闭 pool。
 
 ---
 
@@ -123,11 +124,11 @@ v2 中 `allocate_page` / `dispose_page` 只修改内存 header，header 要等�
 
 v3 改为：
 
-- `allocate_page` 更新 `first_free_page` / `page_count` 后，立即把 header 页写入 WAL 和数据文件；
-- `dispose_page` 更新 free list 后，同样立即持久化 header；
-- 代价是每次分配/释放多一次 header 页写入。
+- `allocate_page` / `dispose_page` 把「新的 header 页 + 清零/挂入 free list 的数据页」作为**一条两页 WAL record** 追加并 fsync，然后依次写两个数据页；
+- 崩溃恢复时两条页镜像一起重放，因此不会出现只恢复 header 或只恢复数据页的中间状态；
+- 代价是每次分配/释放多一次 header 页写入和两个页面的 WAL 空间。
 
-这样分配元数据在崩溃恢复时不会落后于数据页。
+注意：如果 WAL 追加成功但当前进程内的数据页写入失败，内存 header 不会提交；磁盘上的中间状态由下次打开时的 WAL replay 修正。
 
 ### 尚未做的 durability 项
 
@@ -187,3 +188,39 @@ tests/test_background_flush_pressure.cpp
 ```
 
 它用 2 帧的小池持续读写/dispose，同时让后台刷脏运行，要求不出现误报的 `BUFFERPOOL_NOBUF` 或 `BUFFERPOOL_PAGE_PINNED`。
+
+---
+
+## 10. 预取与释放页的竞态修复
+
+预取是异步的：`prefetch_page(page)` 入队后，调用方可能立刻 `dispose_page(page)` 或通过 `allocate_page` 复用该页。  
+如果预取 worker 此时才把旧页读入缓存，会得到一帧已经不属于当前页的数据。
+
+v3 的处理：
+
+- `FrameManager` 维护 `prefetch_pending_` 与 `prefetch_active_`；
+- `cancel_prefetch(owner, page)` 先删除尚未执行的队列项，再等待该页在途预取完成；
+- `dispose_page` 和 `allocate_page` 复用空闲页前都会先 `cancel_prefetch`，再 `remove_page` 清掉可能存在的旧缓存。
+
+回归测试：
+
+```text
+tests/test_prefetch_dispose_race.cpp
+```
+
+测试在 1 帧的池中循环“预取 -> 释放 -> 复用”，并检查复用页必须是清零后的新页。
+
+## 11. WAL 两页 record
+
+`PageWAL` 新增：
+
+```cpp
+RC append_two_pages_and_sync(PageNum page_a, const char *data_a,
+                             PageNum page_b, const char *data_b);
+```
+
+- record header 的 `size` 为 `2 * BP_PAGE_SIZE`，`page_num` / `reserved2` 分别保存两个页号；
+- CRC 覆盖两页数据；任意一页损坏都会让整条 record 被丢弃，不会只重放其中一页；
+- 单页 record 的格式保持不变，旧 WAL 仍可回放。
+
+回归测试覆盖两页 record 的正常回放和“第二页损坏时整条 record 不生效”。

@@ -213,13 +213,21 @@ RC PageWAL::replay(const std::function<RC(PageNum, const char *)> &writer)
     if (header_got != sizeof(header)) {
       break;  // torn tail
     }
-    if (header.magic != WAL_RECORD_MAGIC || header.size != BP_PAGE_SIZE ||
-        header.page_num < 0 || header.page_num > (1 << 30)) {
+    const bool two_pages = header.size == 2 * BP_PAGE_SIZE;
+    if (header.magic != WAL_RECORD_MAGIC ||
+        (header.size != BP_PAGE_SIZE && !two_pages) ||
+        header.page_num < 0 || header.page_num > (1 << 30) ||
+        (two_pages && (header.reserved2 < 0 || header.reserved2 > (1 << 30)))) {
       break;
     }
 
-    const size_t data_got = fread(record.data() + sizeof(header), 1, BP_PAGE_SIZE, file_);
-    if (data_got != BP_PAGE_SIZE) {
+    if (two_pages) {
+      record.resize(sizeof(header) + 2 * BP_PAGE_SIZE);
+    } else {
+      record.resize(sizeof(header) + BP_PAGE_SIZE);
+    }
+    const size_t data_got = fread(record.data() + sizeof(header), 1, header.size, file_);
+    if (data_got != header.size) {
       break;  // torn tail
     }
 
@@ -235,6 +243,13 @@ RC PageWAL::replay(const std::function<RC(PageNum, const char *)> &writer)
     rc = writer(static_cast<PageNum>(header.page_num), record.data() + sizeof(header));
     if (OB_FAIL(rc)) {
       return rc;
+    }
+    if (two_pages) {
+      rc = writer(static_cast<PageNum>(header.reserved2),
+                  record.data() + sizeof(header) + BP_PAGE_SIZE);
+      if (OB_FAIL(rc)) {
+        return rc;
+      }
     }
     if (header.lsn >= last_lsn_) {
       last_lsn_ = header.lsn + 1;
@@ -262,6 +277,44 @@ RC PageWAL::append_and_sync(PageNum page_num, const char *data)
   std::vector<char> record(sizeof(header) + BP_PAGE_SIZE);
   memcpy(record.data(), &header, sizeof(header));
   memcpy(record.data() + sizeof(header), data, BP_PAGE_SIZE);
+  header.crc = crc32(record.data(), record.size());
+  memcpy(record.data(), &header, sizeof(header));
+
+  if (file_seek_end(file_) != 0) {
+    return RC::IOERR_SEEK;
+  }
+  if (fwrite(record.data(), 1, record.size(), file_) != record.size()) {
+    return RC::IOERR_WRITE;
+  }
+  RC rc = sync_file(file_);
+  if (OB_SUCC(rc)) {
+    ++last_lsn_;
+  }
+  return rc;
+}
+
+RC PageWAL::append_two_pages_and_sync(PageNum page_a, const char *data_a,
+                                         PageNum page_b, const char *data_b)
+{
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (file_ == nullptr) {
+    return RC::FILE_NOT_OPENED;
+  }
+  if (data_a == nullptr || data_b == nullptr || page_a < 0 || page_b < 0) {
+    return RC::INVALID_ARGUMENT;
+  }
+
+  WALRecordHeader header;
+  header.lsn       = last_lsn_;
+  header.size      = 2 * BP_PAGE_SIZE;
+  header.page_num  = page_a;
+  header.reserved2 = page_b;
+  header.crc       = 0;
+
+  std::vector<char> record(sizeof(header) + 2 * BP_PAGE_SIZE);
+  memcpy(record.data(), &header, sizeof(header));
+  memcpy(record.data() + sizeof(header), data_a, BP_PAGE_SIZE);
+  memcpy(record.data() + sizeof(header) + BP_PAGE_SIZE, data_b, BP_PAGE_SIZE);
   header.crc = crc32(record.data(), record.size());
   memcpy(record.data(), &header, sizeof(header));
 
