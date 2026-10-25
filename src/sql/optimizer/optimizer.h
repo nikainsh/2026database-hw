@@ -43,8 +43,10 @@ public:
   RC optimize();
 
 private:
-  /// 谓词下推：只涉及单表的条件搬到 table_get 上，尽早减少数据量
+  /// 谓词下推：只涉及单表的条件搬到 table_get 上，尽早减少数据量；连接条件搬到 join 上
   RC predicate_pushdown();
+  /// 连接顺序：基数小的表当驱动表，让内表有机会走索引查找
+  RC reorder_joins_by_cardinality();
   /// 比较式化简：常量比较折叠成 TRUE/FALSE，恒真条件删除，恒假标记空扫描
   RC comparison_simplification();
 

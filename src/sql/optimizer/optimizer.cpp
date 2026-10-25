@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <set>
 #include <sstream>
 
@@ -195,15 +196,50 @@ RC Optimizer::optimize()
   if (OB_FAIL(rc)) {
     return rc;
   }
+  rc = reorder_joins_by_cardinality();
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
   return comparison_simplification();
 }
 
 /**
  * @brief 谓词下推
- * @details 把一个 AND 串起来的条件拆开：只涉及一张表的条件下推到该表的 table_get 上，
- *          需要多张表才能算的条件留在 predicate 里。这样扫描阶段就能尽量少地输出行，
- *          也为后面的索引选择创造条件。
+ * @details 把一个 AND 串起来的条件拆开：
+ *          1) 只涉及一张表的条件下推到该表的 table_get 上，扫描阶段就尽量少输出行，
+ *             也为后面的索引选择创造条件；
+ *          2) 两侧各出一张表列的等值条件（连接条件）挂到 join 节点上，物理计划阶段
+ *             才能用它把「内表全扫」换成「按连接键的索引查找」；
+ *          3) 其余需要多张表才能算的条件留在 predicate 里。
  */
+/// 找出树里所有连接节点
+static void collect_joins(LogicalOperator &node, std::vector<JoinOperator *> &joins)
+{
+  if (node.kind() == LogicalOperatorKind::JOIN) {
+    joins.push_back(static_cast<JoinOperator *>(&node));
+  }
+  for (const auto &child : node.children()) {
+    collect_joins(*child, joins);
+  }
+}
+
+/// 判断一个等值比较是不是「两侧分别是两张表的列」，即可以当连接条件用
+static bool is_two_table_equality(Expression *expr, std::set<int> &tables)
+{
+  if (expr->expr_type() != ExprType::COMPARISON) {
+    return false;
+  }
+  ComparisonExpression *comparison = static_cast<ComparisonExpression *>(expr);
+  if (comparison->comp() != CompOp::EQUAL_TO || comparison->left() == nullptr || comparison->right() == nullptr) {
+    return false;
+  }
+  if (comparison->left()->expr_type() != ExprType::COLUMN || comparison->right()->expr_type() != ExprType::COLUMN) {
+    return false;
+  }
+  tables = involved_tables(expr);
+  return tables.size() == 2;
+}
+
 RC Optimizer::predicate_pushdown()
 {
   std::vector<TableGetOperator *> gets;
@@ -223,6 +259,30 @@ RC Optimizer::predicate_pushdown()
   };
   walk(*plan_.root);
 
+  std::vector<JoinOperator *> joins;
+  collect_joins(*plan_.root, joins);
+
+  /// 找到能同时算出这几张表列的那个连接节点
+  auto join_covering = [&joins](const std::set<int> &tables) {
+    for (JoinOperator *join : joins) {
+      std::vector<TableGetOperator *> covered;
+      collect_table_gets(*join, covered);
+      bool all = true;
+      for (int table_index : tables) {
+        if (std::find_if(covered.begin(), covered.end(), [table_index](TableGetOperator *get) {
+              return get->table_index() == table_index;
+            }) == covered.end()) {
+          all = false;
+          break;
+        }
+      }
+      if (all) {
+        return join;
+      }
+    }
+    return static_cast<JoinOperator *>(nullptr);
+  };
+
   for (PredicateOperator *predicate : predicates) {
     std::vector<Expression *> conjuncts;
     for (Expression *conjunct : predicate->conjuncts()) {
@@ -231,6 +291,15 @@ RC Optimizer::predicate_pushdown()
 
     std::vector<Expression *> residual;
     for (Expression *conjunct : conjuncts) {
+      std::set<int> join_tables;
+      if (is_two_table_equality(conjunct, join_tables)) {
+        JoinOperator *join = join_covering(join_tables);
+        if (join != nullptr) {
+          join->add_on_condition(conjunct);
+          continue;
+        }
+      }
+
       const std::set<int> tables = involved_tables(conjunct);
       if (tables.size() == 1) {
         const int  table_index = *tables.begin();
@@ -247,6 +316,38 @@ RC Optimizer::predicate_pushdown()
     }
 
     predicate->set_conjuncts(std::move(residual));
+  }
+  return RC::SUCCESS;
+}
+
+/**
+ * @brief 连接顺序
+ * @details 嵌套循环连接的代价 ≈ 左边的行数 × 右边每行的代价，所以把基数小的表放到
+ *          左边当驱动表。元组是「每列自带来源」的，换顺序不会改变表达式求值的结果，
+ *          输出列的顺序由 select 列表决定，因此这一步是安全的。
+ */
+RC Optimizer::reorder_joins_by_cardinality()
+{
+  std::vector<JoinOperator *> joins;
+  collect_joins(*plan_.root, joins);
+
+  for (JoinOperator *join : joins) {
+    if (join->children().size() < 2) {
+      continue;
+    }
+    auto rows_of = [](const std::unique_ptr<LogicalOperator> &child) -> int64_t {
+      if (child->kind() != LogicalOperatorKind::TABLE_GET) {
+        return std::numeric_limits<int64_t>::max();
+      }
+      Table *table = static_cast<TableGetOperator *>(child.get())->table();
+      int64_t rows = 0;
+      return OB_SUCC(table->record_count(rows)) ? rows : 0;
+    };
+    std::stable_sort(join->mutable_children().begin(), join->mutable_children().end(),
+                     [&rows_of](const std::unique_ptr<LogicalOperator> &a,
+                                 const std::unique_ptr<LogicalOperator> &b) {
+                       return rows_of(a) < rows_of(b);
+                     });
   }
   return RC::SUCCESS;
 }
@@ -337,11 +438,222 @@ RC Optimizer::comparison_simplification()
 // 物理计划
 // ---------------------------------------------------------------------------
 
+namespace {
+
+/// 代价单位 = "全表扫描多处理一行" 的相对开销。系数由 tests/bench_sql.cpp 在
+/// 20 万行 / 8KB 页的数据集上标定（见 docs/optimization-log.md）：
+///   table_scan 200000 行 ≈ 11.7 ms  => 58.5 ns/行
+///   index_scan + 回表 2000 行 ≈ 1.02 ms => 509 ns/行  => 回表一行 ≈ 扫 8.7 行
+constexpr double kIndexRowCost   = 8.7;
+constexpr double kIndexTreePages = 4.0;  /// 树高带来的固定页读
+
+bool as_double(const Value &value, double &out)
+{
+  Value casted;
+  if (OB_FAIL(value.cast_to(AttrType::FLOAT, casted))) {
+    return false;
+  }
+  out = casted.get_float();
+  return true;
+}
+
+/// 全表扫描的固定页开销：一页大约放多少行，由记录长度推出。小表上这项主导，
+/// 少了它代价模型会在几行的表上错误地放弃索引。
+int rows_per_page_of(const TableMeta &table_meta)
+{
+  return std::max(1, (BP_PAGE_SIZE - static_cast<int>(sizeof(SlottedPageHeader)) - static_cast<int>(sizeof(int32_t))) /
+                          (table_meta.record_size() + static_cast<int>(sizeof(int32_t))));
+}
+
+/// 估算某个候选索引能命中多少条索引项；返回 -1 表示无法估算
+int64_t estimate_index_rows(Table *table, const Index *index, bool has_equal, const IndexScanRange &range)
+{
+  const IndexStats *stats = table->table_meta().index_stats(index->index_meta().index_name);
+  if (stats == nullptr || !stats->valid || stats->entries <= 0) {
+    return -1;
+  }
+
+  if (has_equal) {
+    const int64_t ndv = stats->distinct_keys > 0 ? stats->distinct_keys : 1;
+    const int64_t matched = stats->entries / ndv;
+    return matched > 0 ? matched : 1;
+  }
+
+  /// 范围条件：用最小/最大键做线性插值（只对数值列成立）
+  const AttrType type = index->index_column() != nullptr ? index->index_column()->type() : AttrType::UNDEFINED;
+  if (type != AttrType::INT && type != AttrType::BIGINT && type != AttrType::FLOAT) {
+    return -1;
+  }
+  Value min_value, max_value;
+  if (OB_FAIL(index->decode_key(stats->min_key, min_value)) || OB_FAIL(index->decode_key(stats->max_key, max_value))) {
+    return -1;
+  }
+  double low_edge = 0.0, high_edge = 0.0;
+  if (!as_double(min_value, low_edge) || !as_double(max_value, high_edge) || high_edge <= low_edge) {
+    return -1;
+  }
+
+  double lower = low_edge, upper = high_edge;
+  if (range.has_low) {
+    double bound = 0.0;
+    if (!as_double(range.low, bound)) {
+      return -1;
+    }
+    lower = std::max(lower, bound);
+  }
+  if (range.has_high) {
+    double bound = 0.0;
+    if (!as_double(range.high, bound)) {
+      return -1;
+    }
+    upper = std::min(upper, bound);
+  }
+  if (upper <= lower) {
+    return 0;  /// 区间落在键范围之外，扫描必然为空
+  }
+  const double fraction = (upper - lower) / (high_edge - low_edge);
+  int64_t      matched  = static_cast<int64_t>(fraction * static_cast<double>(stats->entries));
+  return matched < 0 ? 0 : matched;
+}
+
+/// 索引嵌套循环连接：内表按外层连接键做索引查找
+struct JoinLookup
+{
+  Expression            *condition     = nullptr;  /// 挂回这一层 NLJ 上，用于结果复核
+  ColumnRef              outer_column;             /// 外层元组里当查询键的那一列
+  Index                 *index         = nullptr;
+};
+
+/// 连接键两侧类型必须一致：value_to_key 会做 cast_to，跨类型（尤其 int/bigint 混用）
+/// 有可能截断而查不到本该匹配的行。宁可不走索引，也不能漏答案。
+bool join_key_types_match(const ColumnExpression &outer, const ColumnMeta &inner)
+{
+  return outer.result_type() == inner.type();
+}
+
+bool choose_join_index_lookup(TableGetOperator &get, const std::vector<Expression *> &conditions,
+                             const std::set<int> &outer_tables, JoinLookup &out)
+{
+  if (OB_FAIL(get.table()->ensure_index_stats())) {
+    return false;
+  }
+  int64_t table_rows = 0;
+  get.table()->record_count(table_rows);
+  const TableMeta &meta        = get.table()->table_meta();
+  const double     scan_cost   = static_cast<double>(table_rows > 0 ? table_rows : 1) + rows_per_page_of(meta);
+
+  for (Expression *condition : conditions) {
+    if (condition->expr_type() != ExprType::COMPARISON) {
+      continue;
+    }
+    ComparisonExpression *comparison = static_cast<ComparisonExpression *>(condition);
+    if (comparison->comp() != CompOp::EQUAL_TO || comparison->left() == nullptr || comparison->right() == nullptr) {
+      continue;
+    }
+    if (comparison->left()->expr_type() != ExprType::COLUMN || comparison->right()->expr_type() != ExprType::COLUMN) {
+      continue;
+    }
+    const ColumnExpression *left  = static_cast<const ColumnExpression *>(comparison->left());
+    const ColumnExpression *right = static_cast<const ColumnExpression *>(comparison->right());
+
+    /// inner 是本表（被查找的一侧），outer 已经在左深树的左边
+    const ColumnExpression *inner = nullptr;
+    const ColumnExpression *outer = nullptr;
+    if (left->table_index() == get.table_index() && outer_tables.count(right->table_index()) > 0) {
+      inner = left;
+      outer = right;
+    } else if (right->table_index() == get.table_index() && outer_tables.count(left->table_index()) > 0) {
+      inner = right;
+      outer = left;
+    } else {
+      continue;
+    }
+    if (inner->column_index() < 0 || inner->column_index() >= static_cast<int>(meta.columns().size())) {
+      continue;
+    }
+    Index *index = get.table()->index_of_field(meta.columns()[inner->column_index()].name());
+    if (index == nullptr || index->index_column() == nullptr) {
+      continue;
+    }
+    if (!join_key_types_match(*outer, *index->index_column())) {
+      continue;
+    }
+
+    const int64_t matched = estimate_index_rows(get.table(), index, true, IndexScanRange());
+    if (matched <= 0) {
+      continue;  /// 估不出来就不赌
+    }
+    if (static_cast<double>(matched) * kIndexRowCost + kIndexTreePages >= scan_cost) {
+      continue;  /// 每行都全表扫更划算（内表很小或连接键选择率太差）
+    }
+
+    out.condition     = condition;
+    out.outer_column  = outer->ref();
+    out.index         = index;
+    return true;
+  }
+  return false;
+}
+
+/// select count(*) from 单表 且没有任何过滤条件：答案就是堆文件头里的记录数，
+/// 不必真的去扫一遍（InnoDB 的 count(*) 短路是同一条思路）
+bool is_plain_count_star(AggregateOperator &aggregate, TableGetOperator *&get)
+{
+  get = nullptr;
+  if (!aggregate.group_by().empty() || aggregate.select_list().size() != 1) {
+    return false;
+  }
+  Expression *expr = aggregate.select_list()[0];
+  if (expr->expr_type() != ExprType::AGGREGATE) {
+    return false;
+  }
+  const AggregateExpression *agg = static_cast<const AggregateExpression *>(expr);
+  if (agg->func() != AggFunc::COUNT || agg->arg() != nullptr) {
+    return false;  /// 只有 count(*) 成立，count(col) 要跳过 NULL
+  }
+  if (aggregate.children().size() != 1 || aggregate.children()[0]->kind() != LogicalOperatorKind::TABLE_GET) {
+    return false;
+  }
+  TableGetOperator *candidate = static_cast<TableGetOperator *>(aggregate.children()[0].get());
+  if (!candidate->filters().empty() || candidate->always_false()) {
+    return false;  /// 有条件就可能过滤掉行，头里的总数不再等于答案
+  }
+  get = candidate;
+  return true;
+}
+
+}  // namespace
+
 bool PhysicalPlanGenerator::choose_index_access(TableGetOperator &get, Index *&index, IndexScanRange &range)
 {
-  index    = nullptr;
-  range    = IndexScanRange();
-  bool equal = false;
+  index = nullptr;
+  range = IndexScanRange();
+
+  /// 每个「有索引的列」是一个候选，各自维护自己的键范围。
+  /// 旧实现把所有列的条件写进同一个 range，导致 `id > 2 and cat < 4` 这类查询
+  /// 用 id 的索引却带上 cat 的上界，扫描区间被非法收窄而漏行。
+  struct Candidate
+  {
+    int            column_index = -1;
+    Index         *index        = nullptr;
+    IndexScanRange range;
+    bool           has_equal    = false;
+  };
+  std::vector<Candidate> candidates;
+
+  auto find_candidate = [&candidates](int column_index) {
+    for (auto &item : candidates) {
+      if (item.column_index == column_index) {
+        return &item;
+      }
+    }
+    return static_cast<Candidate *>(nullptr);
+  };
+
+  auto value_less = [](const Value &a, const Value &b) {
+    int cmp = 0;
+    return OB_SUCC(a.compare_to(b, cmp)) && cmp < 0;
+  };
 
   for (Expression *filter : get.filters()) {
     if (filter->expr_type() != ExprType::COMPARISON) {
@@ -365,48 +677,100 @@ bool PhysicalPlanGenerator::choose_index_access(TableGetOperator &get, Index *&i
     if (column->column_index() < 0 || column->column_index() >= static_cast<int>(meta.columns().size())) {
       continue;
     }
-    Index *candidate = get.table()->index_of_field(meta.columns()[column->column_index()].name());
+
+    Candidate *candidate = find_candidate(column->column_index());
     if (candidate == nullptr) {
-      continue;
+      Index *idx = get.table()->index_of_field(meta.columns()[column->column_index()].name());
+      if (idx == nullptr) {
+        continue;  /// 该列没有索引
+      }
+      candidates.push_back(Candidate{column->column_index(), idx, IndexScanRange(), false});
+      candidate = &candidates.back();
     }
 
     const Value &value = static_cast<const ConstExpression *>(right)->value();
-    bool         usable = true;
     switch (comparison->comp()) {
       case CompOp::EQUAL_TO:
-        range.has_low = range.has_high = true;
-        range.low = range.high          = value;
-        range.low_inclusive = range.high_inclusive = true;
-        equal                                     = true;
+        candidate->range.has_low = candidate->range.has_high = true;
+        candidate->range.low = candidate->range.high          = value;
+        candidate->range.low_inclusive = candidate->range.high_inclusive = true;
+        candidate->has_equal                                    = true;
         break;
       case CompOp::LESS_THAN:
-        range.has_high      = true;
-        range.high          = value;
-        range.high_inclusive = false;
+      case CompOp::LESS_EQUAL: {
+        const bool inclusive = comparison->comp() == CompOp::LESS_EQUAL;
+        if (!candidate->range.has_high || value_less(value, candidate->range.high)) {
+          candidate->range.has_high      = true;
+          candidate->range.high          = value;
+          candidate->range.high_inclusive = inclusive;
+        }
         break;
-      case CompOp::LESS_EQUAL:
-        range.has_high      = true;
-        range.high          = value;
-        range.high_inclusive = true;
-        break;
+      }
       case CompOp::GREAT_THAN:
-        range.has_low      = true;
-        range.low          = value;
-        range.low_inclusive = false;
+      case CompOp::GREAT_EQUAL: {
+        const bool inclusive = comparison->comp() == CompOp::GREAT_EQUAL;
+        if (!candidate->range.has_low || value_less(candidate->range.low, value)) {
+          candidate->range.has_low       = true;
+          candidate->range.low           = value;
+          candidate->range.low_inclusive = inclusive;
+        }
         break;
-      case CompOp::GREAT_EQUAL:
-        range.has_low      = true;
-        range.low          = value;
-        range.low_inclusive = true;
-        break;
-      default: usable = false; break;  /// != 用不上索引
-    }
-
-    if (usable && (index == nullptr || equal)) {
-      index = candidate;
+      }
+      default: break;  /// != 给不出可用的扫描区间
     }
   }
-  return index != nullptr;
+
+  /// 代价化选路：估算每个候选索引能命中多少索引项，回表按 kIndexRowCost 计价，
+  /// 与「整表扫一遍」比较，只有更便宜才真的走索引。
+  /// 估不出来（例如字符列的范围条件）就按"整表那么多行"计，等价于放弃走索引。
+  auto score = [](const Candidate &c) {
+    if (c.has_equal) return 3;
+    if (c.range.has_low && c.range.has_high) return 2;
+    if (c.range.has_low || c.range.has_high) return 1;
+    return 0;
+  };
+
+  int64_t table_rows = 0;
+  get.table()->record_count(table_rows);
+  if (OB_FAIL(get.table()->ensure_index_stats())) {
+    return false;
+  }
+
+  Candidate *best        = nullptr;
+  int64_t    best_rows   = 0;
+  for (auto &c : candidates) {
+    if (score(c) == 0) {
+      continue;  /// 没有有效区间，这个索引用不上
+    }
+    const int64_t stats_rows = table_rows > 0 ? table_rows : 1;
+    int64_t        matched  = estimate_index_rows(get.table(), c.index, c.has_equal, c.range);
+    if (matched < 0) {
+      matched = stats_rows;
+    }
+    if (best == nullptr || matched < best_rows) {
+      best      = &c;
+      best_rows = matched;
+    }
+  }
+  if (best == nullptr) {
+    LOG_DBG("no index candidate for table=%s filters=%d", get.table()->table_name().c_str(),
+            static_cast<int>(get.filters().size()));
+    return false;
+  }
+
+  const double index_cost = static_cast<double>(best_rows) * kIndexRowCost + kIndexTreePages;
+  /// 全表扫描的代价 = 逐行处理 + 一个数据页的固定开销
+  const double scan_cost =
+      static_cast<double>(table_rows > 0 ? table_rows : 1) + rows_per_page_of(get.table()->table_meta());
+  LOG_DBG("access path table=%s rows=%lld matched=%lld index_cost=%.1f scan_cost=%.1f",
+          get.table()->table_name().c_str(), (long long)table_rows, (long long)best_rows, index_cost, scan_cost);
+  if (index_cost >= scan_cost) {
+    return false;  /// 全表扫描更便宜
+  }
+
+  index = best->index;
+  range = best->range;
+  return true;
 }
 
 RC PhysicalPlanGenerator::create(LogicalOperator &logical, std::unique_ptr<PhysicalOperator> &plan)
@@ -460,23 +824,88 @@ RC PhysicalPlanGenerator::create(LogicalOperator &logical, std::unique_ptr<Physi
         return RC::INTERNAL;
       }
 
-      /// 左深树：先把第一个孩子的计划建好，再依次和后面的孩子做嵌套循环连接
+      /// 一棵连接树里有哪几张表，决定条件该挂到左深树的哪一层
+      auto tables_of = [](LogicalOperator &node) {
+        std::vector<TableGetOperator *> covered;
+        collect_table_gets(node, covered);
+        std::set<int> indexes;
+        for (TableGetOperator *get : covered) {
+          indexes.insert(get->table_index());
+        }
+        return indexes;
+      };
+
       std::unique_ptr<PhysicalOperator> left;
       RC                                rc = create(*join.children()[0], left);
       if (OB_FAIL(rc)) {
         return rc;
       }
+      std::set<int> outer_tables = tables_of(*join.children()[0]);
+      std::vector<Expression *> unattached = join.on_conditions();
+
       for (size_t i = 1; i < join.children().size(); ++i) {
+        LogicalOperator &child       = *join.children()[i];
+        const std::set<int> child_tables = tables_of(child);
+
+        /// 等两边都能算的时候才挂上来，挂早了元组里还没有对应的列
+        std::vector<Expression *> step_conditions;
+        for (Expression *condition : join.on_conditions()) {
+          const std::set<int> involved = involved_tables(condition);
+          bool                ready    = true;
+          bool                covers   = false;
+          for (int table_index : involved) {
+            if (child_tables.count(table_index) > 0) {
+              covers = true;
+            } else if (outer_tables.count(table_index) == 0) {
+              ready = false;
+            }
+          }
+          if (ready && covers) {
+            step_conditions.push_back(condition);
+            unattached.erase(std::remove(unattached.begin(), unattached.end(), condition), unattached.end());
+          }
+        }
+
         std::unique_ptr<PhysicalOperator> right;
-        rc = create(*join.children()[i], right);
+        rc = create(child, right);
         if (OB_FAIL(rc)) {
           return rc;
         }
-        auto nested = std::make_unique<NestedLoopJoinOperator>(nullptr);
+
+        /// 索引嵌套循环连接：内表本来要全扫，但连接列上有索引且更便宜，
+        /// 就改成「按外层这一行的键值查索引」。连接条件仍会在 NLJ 里复核，
+        /// 所以这一步只影响快慢，不影响结果。
+        if (child.kind() == LogicalOperatorKind::TABLE_GET &&
+            right->kind() == PhysicalOperatorKind::TABLE_SCAN) {
+          TableGetOperator &get       = *static_cast<TableGetOperator *>(&child);
+          JoinLookup        lookup;
+          if (choose_join_index_lookup(get, step_conditions, outer_tables, lookup)) {
+            auto scan = std::make_unique<IndexScanOperator>(get.table(), lookup.index, get.filters(),
+                                                            IndexScanRange(), get.table_index());
+            scan->set_join_key(lookup.outer_column);
+            right = std::move(scan);
+          }
+        }
+
+        auto nested = std::make_unique<NestedLoopJoinOperator>(std::move(step_conditions));
         nested->add_child(std::move(left));
         nested->add_child(std::move(right));
         left = std::move(nested);
+
+        for (int table_index : child_tables) {
+          outer_tables.insert(table_index);
+        }
       }
+
+      /// 兜底：挂不上任何一层的连接条件（理论上不该发生）继续在顶层过滤，宁可慢不能漏
+      if (!unattached.empty()) {
+        LOG_WARN("join condition not attached to any join step, kept as filter. count=%d",
+                 static_cast<int>(unattached.size()));
+        auto filter = std::make_unique<FilterPhysicalOperator>(unattached);
+        filter->add_child(std::move(left));
+        left = std::move(filter);
+      }
+
       plan = std::move(left);
       return RC::SUCCESS;
     }
@@ -496,6 +925,18 @@ RC PhysicalPlanGenerator::create(LogicalOperator &logical, std::unique_ptr<Physi
 
     case LogicalOperatorKind::AGGREGATE: {
       AggregateOperator &aggregate = *static_cast<AggregateOperator *>(&logical);
+
+      TableGetOperator *count_get = nullptr;
+      if (is_plain_count_star(aggregate, count_get)) {
+        int64_t rows = 0;
+        if (OB_SUCC(count_get->table()->record_count(rows))) {
+          auto single = std::make_unique<StringListOperator>();
+          single->add_row(std::vector<Value>{Value(rows)});
+          plan = std::move(single);
+          return RC::SUCCESS;
+        }
+      }
+
       std::unique_ptr<PhysicalOperator> child;
       RC rc = create(*aggregate.children()[0], child);
       if (OB_FAIL(rc)) {
