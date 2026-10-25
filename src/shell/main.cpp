@@ -231,6 +231,7 @@ struct Options
   std::string sql_file;
   std::string execute_sql;
   bool        verbose    = false;
+  bool        profile    = false;
   bool        show_rows  = true;
   bool        print_help = false;
 };
@@ -250,6 +251,8 @@ Options parse_args(int argc, char **argv)
       options.execute_sql = argv[++i];
     } else if (arg == "--verbose") {
       options.verbose = true;
+    } else if (arg == "--profile") {
+      options.profile = true;
     } else if (arg == "--quiet") {
       options.show_rows = false;
     } else if (arg == "-h" || arg == "--help") {
@@ -271,6 +274,7 @@ void usage()
       "  -f <file>       run a SQL script and exit\n"
       "  -e <sql>        run one statement and exit\n"
       "  --verbose       print debug logs\n"
+      "  --profile       show per-operator execution statistics\n"
       "  --quiet         do not print result rows\n"
       "  -h, --help      show this help\n");
 }
@@ -285,6 +289,9 @@ bool run_statement(QueryEngine &engine, const std::string &sql, ResultWriter &wr
 
   SqlResult result;
   RC        rc = engine.execute(sql, writer, result);
+  if (!engine.last_profile().empty()) {
+    std::printf("%s", engine.last_profile().c_str());
+  }
 
   if (result.want_exit) {
     want_exit = true;
@@ -336,6 +343,7 @@ int main(int argc, char **argv)
   }
 
   QueryEngine     engine(db);
+  engine.set_profile_enabled(options.profile);
   TableOutput     writer;
   MessageOutput   quiet_writer(options.show_rows);
   ResultWriter   &out = options.show_rows ? static_cast<ResultWriter &>(writer) : static_cast<ResultWriter &>(quiet_writer);

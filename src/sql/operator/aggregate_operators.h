@@ -24,6 +24,7 @@ public:
   PhysicalOperatorKind kind() const override { return PhysicalOperatorKind::SCALAR_GROUP_BY; }
   RC                   open() override;
   RC                   next(Tuple *&tuple) override;
+  RC                   close() override;
   std::string          describe() const override;
 
 private:
@@ -31,12 +32,12 @@ private:
   std::vector<AggregateState> states_;
   Tuple                     tuple_;
   bool                      emitted_ = false;
+  bool                      child_opened_ = false;
 };
 
 /**
  * @brief group by 聚合：按分组键把数据分桶，每组算一次聚合
- * @details 对应 miniob 的 HashGroupByPhysicalOperator。这里的“哈希表”用有序表实现，
- *          好处是输出顺序稳定、可预测，便于测试与展示。
+ * @details 当前使用有序表查找分组，输出按分组首次遇到顺序，不保证 SQL 排序。
  */
 class HashGroupByOperator : public PhysicalOperator
 {
@@ -48,6 +49,7 @@ public:
   PhysicalOperatorKind kind() const override { return PhysicalOperatorKind::HASH_GROUP_BY; }
   RC                   open() override;
   RC                   next(Tuple *&tuple) override;
+  RC                   close() override;
   std::string          describe() const override;
 
 private:
@@ -57,7 +59,7 @@ private:
     std::vector<AggregateState> states;
   };
 
-  /// 分组键：把每个键值编码成 "type|text" 串起来
+  /// 分组键：类型、长度及无损值编码，避免显示精度与分隔符碰撞。
   RC make_group_key(const Tuple &tuple, std::string &key);
 
   std::vector<Expression *> select_list_;
@@ -67,4 +69,5 @@ private:
   std::vector<Group>            groups_;
   Tuple                         tuple_;
   size_t                        cursor_ = 0;
+  bool                          child_opened_ = false;
 };

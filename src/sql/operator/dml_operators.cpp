@@ -47,7 +47,7 @@ RC DeleteOperator::open()
   next_rid_index_  = 0;
   rids_.clear();
 
-  RC rc = children_[0]->open();
+  RC rc = children_[0]->open_tracked();
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -57,23 +57,23 @@ RC DeleteOperator::open()
   /// deadlock against the index's write lock.
   while (true) {
     Tuple *child_tuple = nullptr;
-    rc                 = children_[0]->next(child_tuple);
+    rc                 = children_[0]->next_tracked(child_tuple);
     if (rc == RC::RECORD_EOF) {
       break;
     }
     if (OB_FAIL(rc)) {
-      children_[0]->close();
+      children_[0]->close_tracked();
       return rc;
     }
     if (!child_tuple->has_rid) {
-      children_[0]->close();
+      children_[0]->close_tracked();
       LOG_ERROR("the scan tuple carries no rid, cannot delete");
       return RC::RECORD_INVALID_RID;
     }
     rids_.push_back(child_tuple->rid);
   }
 
-  RC close_rc = children_[0]->close();
+  RC close_rc = children_[0]->close_tracked();
   if (OB_FAIL(close_rc)) {
     return close_rc;
   }
@@ -115,30 +115,30 @@ RC UpdateOperator::open()
   next_rid_index_ = 0;
   rids_.clear();
 
-  RC rc = children_[0]->open();
+  RC rc = children_[0]->open_tracked();
   if (OB_FAIL(rc)) {
     return rc;
   }
 
   while (true) {
     Tuple *child_tuple = nullptr;
-    rc                 = children_[0]->next(child_tuple);
+    rc                 = children_[0]->next_tracked(child_tuple);
     if (rc == RC::RECORD_EOF) {
       break;
     }
     if (OB_FAIL(rc)) {
-      children_[0]->close();
+      children_[0]->close_tracked();
       return rc;
     }
     if (!child_tuple->has_rid) {
-      children_[0]->close();
+      children_[0]->close_tracked();
       LOG_ERROR("the scan tuple carries no rid, cannot update");
       return RC::RECORD_INVALID_RID;
     }
     rids_.push_back(child_tuple->rid);
   }
 
-  RC close_rc = children_[0]->close();
+  RC close_rc = children_[0]->close_tracked();
   if (OB_FAIL(close_rc)) {
     return close_rc;
   }

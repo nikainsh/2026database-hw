@@ -18,10 +18,21 @@ static int64_t elapsed_us(std::chrono::steady_clock::time_point start)
 
 RC QueryEngine::run_plan(PhysicalOperator &plan, const SqlResult &input, ResultWriter &writer)
 {
+  last_profile_.clear();
+  plan.reset_statistics(profile_enabled_);
+  auto save_profile = [&]() {
+    if (profile_enabled_) {
+      std::ostringstream out;
+      out << "== execution profile (inclusive times; output rendering excluded) ==\n";
+      plan.explain_statistics(out);
+      last_profile_ = out.str();
+    }
+  };
   SqlResult local  = input;
-  RC        rc     = plan.open();
+  RC        rc     = plan.open_tracked();
   if (OB_FAIL(rc)) {
     local.code = rc;
+    save_profile();
     writer.write_result(local);
     return rc;
   }
@@ -34,7 +45,7 @@ RC QueryEngine::run_plan(PhysicalOperator &plan, const SqlResult &input, ResultW
   // 表头输出失败也走统一收尾，不再跳过已打开计划的 close。
   while (OB_SUCC(rc)) {
     Tuple *tuple = nullptr;
-    rc         = plan.next(tuple);
+    rc         = plan.next_tracked(tuple);
     if (rc == RC::RECORD_EOF) {
       rc = RC::SUCCESS;
       break;
@@ -50,7 +61,7 @@ RC QueryEngine::run_plan(PhysicalOperator &plan, const SqlResult &input, ResultW
     }
   }
 
-  RC close_rc = plan.close();
+  RC close_rc = plan.close_tracked();
   if (OB_FAIL(close_rc) && rc == RC::SUCCESS) {
     rc = close_rc;
   }
@@ -58,6 +69,7 @@ RC QueryEngine::run_plan(PhysicalOperator &plan, const SqlResult &input, ResultW
   local.code           = rc;
   local.rows           = rows;
   local.affected_rows  = plan.affected_rows();
+  save_profile();
   // 输出最终概要失败不能被当作执行成功；已有错误则优先保留。
   RC result_rc = writer.write_result(local);
   if (OB_SUCC(rc)) {
@@ -83,6 +95,7 @@ static void build_desc_rows(const TableMeta &meta, StringListOperator &list)
 
 RC QueryEngine::execute(const std::string &sql, ResultWriter &writer, SqlResult &result)
 {
+  last_profile_.clear();  // 解析失败或 DDL 不能显示上一次计划的统计。
   const auto start = std::chrono::steady_clock::now();
 
   std::unique_ptr<ParseResult> parse_result;

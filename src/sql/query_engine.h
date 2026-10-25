@@ -61,10 +61,15 @@ public:
 
   Db *db() const { return db_; }
 
+  void set_profile_enabled(bool enabled) { profile_enabled_ = enabled; }
+  const std::string &last_profile() const { return last_profile_; }
+
   /// 执行已构造的物理计划，不经过 SQL 编译；供算子集成与独立测试使用。
   /// open 成功后，无论执行/输出是否失败，均调用 close；保留最先出现的错误。
   RC run_plan(PhysicalOperator &plan, const SqlResult &result, ResultWriter &writer);
 
 private:
   Db *db_ = nullptr;
+  bool profile_enabled_ = false;
+  std::string last_profile_;
 };
