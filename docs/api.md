@@ -253,6 +253,13 @@ RC rc = bpm.close_file(path);   // 现在可以成功
 
 如果 `close` 返回 `BUFFERPOOL_HANDLE_BUSY`，说明还有 handle 没释放。
 
+### 6.4 与 flush / close 的并发
+
+- `close` 会先等待该文件的后台预取/刷脏操作，再刷脏并移除 frame 所有权；
+- 不要在一个线程执行 `close` 的同时从其他线程调用 `flush_page`、`flush_all_buffers` 或 `checkpoint`；
+- `close` 失败时 pool 仍保持打开、frame 所有权不变，修复 I/O 或释放句柄后可以重试；
+- 建议由管理生命周期的线程统一执行 flush 和 close。
+
 ---
 
 ## 7. 只读模式

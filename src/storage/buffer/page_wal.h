@@ -14,15 +14,17 @@
  * @brief Page-level redo WAL.
  *
  * This is intentionally a *buffer-manager building block*, not a full
- * transaction log. Every record contains a complete 8KB page image. Before a
- * dirty page is written to the data file, its image is appended to the WAL and
- * fsync'ed. On open, valid records are replayed in order and the WAL is then
- * truncated after the data file has been fsync'ed.
+ * transaction log. Every record contains one or two complete 8KB page images.
+ * A two-page record is used to update allocation metadata and the page content
+ * atomically. Before a dirty page is written to the data file, its image is
+ * appended to the WAL and fsync'ed. On open, valid records are replayed in
+ * order and the WAL is then truncated after the data file has been fsync'ed.
  *
  * Consequences:
  *   - Crash after WAL sync but before/during data-page write is recoverable.
- *   - Crash between two page writes can leave a transaction partially applied;
- *     transactional atomicity requires a higher-level transaction manager.
+ *   - A crash between the writes of a larger multi-page operation can still
+ *     leave it partially applied; cross-operation atomicity belongs to a
+ *     higher-level transaction manager.
  *   - Full-page images are simple but write-heavy. A production system would
  *     use physiological logging / page LSN and only log changed bytes.
  */

@@ -495,6 +495,12 @@ RC FrameManager::remove_owner(DiskBufferPool *owner)
       }
     }
     page_table_.erase(page_key(owner, frame.page_id()));
+    auto count_iter = owner_frame_counts_.find(owner);
+    if (count_iter != owner_frame_counts_.end()) {
+      if (--count_iter->second == 0) {
+        owner_frame_counts_.erase(count_iter);
+      }
+    }
     frame.reset();
     frame.set_owner(nullptr);
     --used_frames_;

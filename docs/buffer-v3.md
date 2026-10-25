@@ -82,7 +82,7 @@ Frame latch 在拿到 frame_id 之后单独获取，不和上面几把锁同时�
 - 预取 worker 是单线程；预取是 best-effort，不保证调用返回时页已驻留。
 - 后台刷脏每 50ms 最多处理 4 页，不做后台 checkpoint，也没有 group commit。
 - WAL 仍是页级 full-page redo；尚未启用 doublewrite / 数据页 checksum。
-- `flush_page` / `flush_all_buffers` 会与页写入串行化；调用方仍应避免在持有写句柄时关闭 pool。
+- `flush_page` / `flush_all_buffers` 会与页写入串行化；调用方不应在另一个线程同时 `close` 同一个 pool。
 
 ---
 
@@ -193,7 +193,7 @@ tests/test_background_flush_pressure.cpp
 
 ## 10. 预取与释放页的竞态修复
 
-预取是异步的：`prefetch_page(page)` 入队后，调用方可能立刻 `dispose_page(page)` 或通过 `allocate_page` 复用该页。  
+预取是异步的：`prefetch_page(page)` 入队后，调用方可能立刻 `dispose_page(page)` 或通过 `allocate_page` 复用该页。
 如果预取 worker 此时才把旧页读入缓存，会得到一帧已经不属于当前页的数据。
 
 v3 的处理：
