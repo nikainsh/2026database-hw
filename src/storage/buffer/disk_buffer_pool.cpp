@@ -315,6 +315,10 @@ RC DiskBufferPool::close()
     closing_ = true;
   }
 
+  if (frame_manager_ != nullptr) {
+    frame_manager_->cancel_owner(this);
+  }
+
   RC rc = flush_all_buffers();
   if (frame_manager_ != nullptr) {
     RC remove_rc = frame_manager_->remove_owner(this);
@@ -791,13 +795,22 @@ char *DiskBufferPool::frame_data(FrameId frame_id)
 
 RC DiskBufferPool::prefetch_page(PageNum page_num)
 {
-  PageHandle handle;
-  RC         rc = get_page_read(page_num, handle);
-  if (OB_SUCC(rc)) {
-    stats_.prefetches.fetch_add(1, std::memory_order_relaxed);
-    handle.reset();
+  std::lock_guard<std::mutex> guard(meta_mutex_);
+  if (closed_ || closing_) {
+    return RC::FILE_NOT_OPENED;
   }
-  return rc;
+  if (page_num <= BP_HEADER_PAGE || page_num >= header_.page_count) {
+    return RC::BUFFERPOOL_INVALID_PAGE_NUM;
+  }
+  if (free_pages_.count(page_num) > 0) {
+    return RC::BUFFERPOOL_PAGE_FREED;
+  }
+  if (frame_manager_ == nullptr) {
+    return RC::FILE_NOT_OPENED;
+  }
+  frame_manager_->prefetch(this, page_num);
+  stats_.prefetches.fetch_add(1, std::memory_order_relaxed);
+  return RC::SUCCESS;
 }
 
 RC DiskBufferPool::prefetch_range(PageNum start_page, int count)

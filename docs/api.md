@@ -332,11 +332,12 @@ pool->prefetch_page(page);
 pool->prefetch_range(start_page, count);
 ```
 
-当前是**同步预热**：
+v3 起是**异步预取**：
 
-- 读入页并立即 unpin；
-- 不会返回 `PageHandle`；
-- 会阻塞到 I/O 完成；
+- `prefetch_page` / `prefetch_range` 只入队，立即返回；
+- 后台 worker 负责读页并立即 unpin；
+- 同一页已在缓存、正在加载或已在队列中时自动去重；
+- 不会返回 `PageHandle`，也不保证返回时页已经读入；
 - 适合扫描器在顺序读取前提前调用。
 
 已接入：
@@ -344,7 +345,7 @@ pool->prefetch_range(start_page, count);
 - `RecordScanner::next`：每跨 4 页预取后续最多 4 页；
 - `BplusTreeScanner::move_to_next_leaf`：预取 `next_leaf`。
 
-后续可替换为后台预取线程/队列。
+后台 worker 在空闲时也会按阈值刷少量脏页。
 
 ---
 

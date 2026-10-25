@@ -1,6 +1,7 @@
 /* database26 buffer manager - global frame pool and replacement */
 #include "storage/buffer/frame_manager.h"
 
+#include <chrono>
 #include <limits>
 
 #include "common/log.h"
@@ -13,7 +14,157 @@ FrameManager::FrameManager(int total_frames) : total_frames_(total_frames > 0 ? 
     frames_[i].init(static_cast<FrameId>(i));
     frames_[i].set_owner(nullptr);
   }
+  worker_ = std::thread(&FrameManager::worker_loop, this);
 }
+
+void FrameManager::worker_loop()
+{
+  while (true) {
+    PrefetchRequest request;
+    bool            has_request = false;
+
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      if (!stop_ && prefetch_queue_.empty()) {
+        work_cv_.wait_for(lock, std::chrono::milliseconds(50),
+                          [&]() { return stop_ || !prefetch_queue_.empty(); });
+      }
+      if (stop_) {
+        break;
+      }
+      if (!prefetch_queue_.empty()) {
+        request = prefetch_queue_.front();
+        prefetch_queue_.pop_front();
+        if (closing_owners_.count(request.owner) > 0) {
+          prefetch_pending_.erase(page_key(request.owner, request.page));
+          continue;
+        }
+        ++owner_active_ops_[request.owner];
+        has_request = true;
+      }
+    }
+
+    if (has_request) {
+      FrameId frame_id = INVALID_FRAME_ID;
+      RC      rc       = acquire(request.owner, request.page, &frame_id);
+      if (OB_SUCC(rc)) {
+        unpin(frame_id);
+      }
+
+      std::lock_guard<std::mutex> lock(mutex_);
+      prefetch_pending_.erase(page_key(request.owner, request.page));
+      auto iter = owner_active_ops_.find(request.owner);
+      if (iter != owner_active_ops_.end()) {
+        if (--iter->second == 0) {
+          owner_active_ops_.erase(iter);
+        }
+      }
+      cv_.notify_all();
+      continue;
+    }
+
+    /// No prefetch request: use the idle tick to flush a few dirty pages.
+    flush_some();
+  }
+}
+
+void FrameManager::flush_some()
+{
+  std::vector<FrameId> batch;
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    for (int i = 0; i < total_frames_ && batch.size() < 4; ++i) {
+      Frame &frame = frames_[i];
+      if (frame.owner() == nullptr || frame.page_id() == INVALID_PAGE_NUM || !frame.is_dirty() ||
+          frame.isLoading() || frame.pin_count() > 0 || closing_owners_.count(frame.owner()) > 0) {
+        continue;
+      }
+      frame.increase_pin_count();
+      ++owner_active_ops_[frame.owner()];
+      batch.push_back(frame.frame_id());
+    }
+  }
+
+  for (FrameId frame_id : batch) {
+    Frame *frame = frame_at(frame_id);
+    if (frame == nullptr) {
+      continue;
+    }
+    DiskBufferPool *owner = frame->owner();
+    lock_exclusive(frame_id);
+    flush_frame_locked(*frame);
+    unlock_exclusive(frame_id);
+    unpin(frame_id);
+
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto iter = owner_active_ops_.find(owner);
+    if (iter != owner_active_ops_.end()) {
+      if (--iter->second == 0) {
+        owner_active_ops_.erase(iter);
+      }
+    }
+    cv_.notify_all();
+  }
+}
+
+void FrameManager::prefetch(DiskBufferPool *owner, PageNum page)
+{
+  if (owner == nullptr) {
+    return;
+  }
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (stop_ || closing_owners_.count(owner) > 0) {
+    return;
+  }
+  const uint64_t key = page_key(owner, page);
+  if (page_table_.count(key) > 0 || prefetch_pending_.count(key) > 0) {
+    return;
+  }
+  prefetch_pending_.insert(key);
+  prefetch_queue_.push_back(PrefetchRequest{owner, page});
+  work_cv_.notify_one();
+}
+
+void FrameManager::cancel_owner(DiskBufferPool *owner)
+{
+  if (owner == nullptr) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(mutex_);
+  closing_owners_.insert(owner);
+
+  for (auto iter = prefetch_queue_.begin(); iter != prefetch_queue_.end();) {
+    if (iter->owner == owner) {
+      prefetch_pending_.erase(page_key(owner, iter->page));
+      iter = prefetch_queue_.erase(iter);
+    } else {
+      ++iter;
+    }
+  }
+
+  auto active = owner_active_ops_.find(owner);
+  while (active != owner_active_ops_.end() && active->second > 0) {
+    cv_.wait(lock);
+    active = owner_active_ops_.find(owner);
+  }
+}
+
+void FrameManager::stop()
+{
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (stop_) {
+      return;
+    }
+    stop_ = true;
+  }
+  work_cv_.notify_all();
+  if (worker_.joinable()) {
+    worker_.join();
+  }
+}
+
+FrameManager::~FrameManager() { stop(); }
 
 uint64_t FrameManager::page_key(DiskBufferPool *owner, PageNum page)
 {
@@ -61,13 +212,23 @@ RC FrameManager::acquire(DiskBufferPool *owner, PageNum page, FrameId *frame_id)
     return RC::INVALID_ARGUMENT;
   }
 
-  std::lock_guard<std::mutex> guard(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
   const uint64_t key = page_key(owner, page);
-  auto           iter = page_table_.find(key);
-  if (iter != page_table_.end()) {
+
+  /// A concurrent miss inserts a loading frame before doing I/O. Wait for the
+  /// loader to finish instead of issuing a duplicate read.
+  while (true) {
+    auto iter = page_table_.find(key);
+    if (iter == page_table_.end()) {
+      break;
+    }
     Frame *frame = frame_at(iter->second);
     if (frame == nullptr) {
       return RC::BUFFERPOOL_CORRUPTED;
+    }
+    if (frame->isLoading()) {
+      cv_.wait(lock);
+      continue;
     }
     frame->increase_pin_count();
     replacement_.on_access(*frame);
@@ -112,12 +273,19 @@ RC FrameManager::acquire(DiskBufferPool *owner, PageNum page, FrameId *frame_id)
   frame->set_page_id(page);
   frame->set_pin_count(1);
   frame->clear_dirty();
+  frame->set_loading(true);
   replacement_.on_access(*frame);
   ++owner_frame_counts_[owner];
   ++used_frames_;
   page_table_[key] = victim_id;
 
+  /// Do the disk read without holding the global frame-manager lock. Different
+  /// pages/files can now fault in parallel.
+  lock.unlock();
   RC rc = owner->read_page_for_cache(page, frame->data());
+  lock.lock();
+
+  frame->set_loading(false);
   if (OB_FAIL(rc)) {
     page_table_.erase(key);
     auto count_iter = owner_frame_counts_.find(owner);
@@ -129,15 +297,16 @@ RC FrameManager::acquire(DiskBufferPool *owner, PageNum page, FrameId *frame_id)
     --used_frames_;
     frame->reset();
     frame->set_owner(nullptr);
+    cv_.notify_all();
     return rc;
   }
 
   owner->stats_.misses.fetch_add(1, std::memory_order_relaxed);
   owner->stats_.reads.fetch_add(1, std::memory_order_relaxed);
   *frame_id = victim_id;
+  cv_.notify_all();
   return RC::SUCCESS;
 }
-
 RC FrameManager::remove_page(DiskBufferPool *owner, PageNum page)
 {
   if (owner == nullptr) {
@@ -277,6 +446,7 @@ RC FrameManager::remove_owner(DiskBufferPool *owner)
     --used_frames_;
   }
   owner_frame_counts_.erase(owner);
+  closing_owners_.erase(owner);
   return rc;
 }
 
@@ -302,6 +472,7 @@ RC FrameManager::mark_dirty(FrameId frame_id)
     return RC::INVALID_ARGUMENT;
   }
   frame->mark_dirty();
+  work_cv_.notify_one();
   return RC::SUCCESS;
 }
 

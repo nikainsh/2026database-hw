@@ -1,9 +1,13 @@
 /* database26 buffer manager - global frame pool and replacement */
 #pragma once
 
+#include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/rc.h"
@@ -25,12 +29,18 @@ class FrameManager
 {
 public:
   explicit FrameManager(int total_frames);
-  ~FrameManager() = default;
+  ~FrameManager();
 
   FrameManager(const FrameManager &)            = delete;
   FrameManager &operator=(const FrameManager &) = delete;
 
   RC acquire(DiskBufferPool *owner, PageNum page, FrameId *frame_id);
+  /// Queue a non-blocking prefetch. Duplicate/queued/cached pages are ignored.
+  void prefetch(DiskBufferPool *owner, PageNum page);
+  /// Stop accepting prefetches for `owner` and wait for in-flight prefetches.
+  void cancel_owner(DiskBufferPool *owner);
+  /// Stop the background worker. Idempotent.
+  void stop();
   RC remove_page(DiskBufferPool *owner, PageNum page);
   RC flush_page(DiskBufferPool *owner, PageNum page);
   RC flush_owner(DiskBufferPool *owner);
@@ -50,8 +60,16 @@ public:
   int total_frames() const { return total_frames_; }
 
 private:
+  struct PrefetchRequest
+  {
+    DiskBufferPool *owner = nullptr;
+    PageNum         page  = INVALID_PAGE_NUM;
+  };
+
   static uint64_t page_key(DiskBufferPool *owner, PageNum page);
   Frame          *frame_at(FrameId frame_id) const;
+  void            worker_loop();
+  void            flush_some();
   FrameId         choose_victim_locked(DiskBufferPool *owner);
   RC              flush_frame_locked(Frame &frame);
 
@@ -61,7 +79,16 @@ private:
   std::unordered_map<DiskBufferPool *, int> owner_frame_counts_;
   LruKPolicy replacement_{2};
 
-  mutable std::mutex mutex_;
+  mutable std::mutex      mutex_;
+  std::condition_variable cv_;
+  std::condition_variable work_cv_;
   int total_frames_ = 0;
   int used_frames_  = 0;
+
+  std::deque<PrefetchRequest>        prefetch_queue_;
+  std::unordered_set<uint64_t>       prefetch_pending_;
+  std::unordered_map<DiskBufferPool *, int> owner_active_ops_;
+  std::unordered_set<DiskBufferPool *>      closing_owners_;
+  std::thread                        worker_;
+  bool                               stop_ = false;
 };

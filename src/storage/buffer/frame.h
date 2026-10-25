@@ -44,6 +44,10 @@ public:
   void mark_dirty() { dirty_.store(true, std::memory_order_relaxed); }
   void clear_dirty() { dirty_.store(false, std::memory_order_relaxed); }
 
+  /// Protected by FrameManager::mutex_.
+  bool isLoading() const { return loading_; }
+  void set_loading(bool value) { loading_ = value; }
+
   DiskBufferPool *owner() const { return owner_; }
   void            set_owner(DiskBufferPool *owner) { owner_ = owner; }
 
@@ -63,6 +67,7 @@ private:
   PageNum         page_id_      = INVALID_PAGE_NUM;
   std::atomic<int> pin_count_{0};
   std::atomic<bool> dirty_{false};
+  bool             loading_     = false;
   DiskBufferPool *owner_        = nullptr;
   Page            page_;
   std::shared_mutex latch_;

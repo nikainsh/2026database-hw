@@ -82,3 +82,34 @@ Frame latch 在拿到 frame_id 之后单独获取，不和上面几把锁同时�
 - WAL 仍是 full-page redo，没有 doublewrite / 数据页 checksum。
 
 这些会在 v3 后续阶段继续处理。
+
+---
+
+## 6. Phase 2：in-flight I/O、异步预取与后台刷脏
+
+### 6.1 页级 in-flight I/O
+
+- 页 miss 时先在全局页表插入一个 `loading` frame，再释放 `FrameManager::mutex_` 做磁盘读。
+- 同一页的并发 miss 会等待条件变量，只发一次磁盘读。
+- 不同文件可以并行缺页；同一个 `DiskBufferPool` 的 `get_page` 仍持 `meta_mutex_`，因此单文件内缺页暂时串行。
+
+### 6.2 异步预取
+
+- `FrameManager` 有一个后台 worker 和预取队列。
+- `prefetch_page` / `prefetch_range` 只入队，立即返回。
+- 页已在缓存、正在 loading 或已在队列中时去重。
+- worker 通过 `acquire()` 读页，然后立即 `unpin()`。
+- `cancel_owner()` 在文件关闭时清空该文件的队列并等待在途预取完成。
+
+### 6.3 后台刷脏
+
+- worker 每 50ms 检查一次，最多刷 4 个脏页。
+- 只选择未 pin、未 loading、owner 未关闭的帧。
+- 使用 `owner_active_ops_` 统计后台操作，`cancel_owner()` 会等待这些操作完成后再关闭文件。
+- 仍然不会在后台做 WAL checkpoint；checkpoint 仍在 `flush_all_buffers()` / `close()` 时同步执行。
+
+### 6.4 已知限制
+
+- 同一个 pool 的缺页仍被 `meta_mutex_` 串行化。
+- 后台刷脏没有 group commit / 批量 WAL 优化。
+- 预取 worker 是单线程；后续可按 CPU/IO 并发度扩展。
