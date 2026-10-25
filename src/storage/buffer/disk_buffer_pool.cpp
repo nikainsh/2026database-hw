@@ -870,12 +870,13 @@ RC DiskBufferPoolManager::create_file(const std::string &path)
   if (by_path_.find(normalized) != by_path_.end()) {
     return RC::BUFFERPOOL_OPEN;
   }
-  if (std::filesystem::exists(normalized)) {
+  if (std::filesystem::exists(path)) {
     return RC::FILE_EXIST;
   }
 
   DiskBufferPool pool;
-  return pool.create_file(normalized);
+  // Keep canonical identity separate from I/O; relative paths remain usable in Chinese Windows directories.
+  return pool.create_file(path);
 }
 
 RC DiskBufferPoolManager::open_file(const std::string &path, ReadWriteMode mode, DiskBufferPool **pool)
@@ -899,7 +900,7 @@ RC DiskBufferPoolManager::open_file(const std::string &path, ReadWriteMode mode,
 
   auto owner = std::make_unique<DiskBufferPool>();
   const int pool_id = next_pool_id_++;
-  RC   rc    = owner->open_with_frame_manager(normalized, mode, frame_limit_, true, &frame_manager_, pool_id);
+  RC   rc    = owner->open_with_frame_manager(path, mode, frame_limit_, true, &frame_manager_, pool_id);
   if (OB_FAIL(rc)) {
     LOG_ERROR("failed to open buffer pool file. path=%s, rc=%s", normalized.c_str(), strrc(rc));
     return rc;
