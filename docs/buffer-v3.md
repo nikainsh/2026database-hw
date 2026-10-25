@@ -138,3 +138,29 @@ v3 改为：
 - 数据页 checksum。
 
 当前页级 full-page WAL 已经能提供 redo；上述两项属于更高等级的介质/崩溃保护，后续如果要启用，需要先确认 sidecar 清理方式。
+
+---
+
+## 8. Phase 4：基准测试
+
+`bench/bench_buffer_pool.cpp` 提供三个通用负载：
+
+- 随机读：512 页，20000 次随机读；
+- 顺序扫描：10 遍全文件扫描；
+- 80/20 混合读写：5000 次操作。
+
+运行：
+
+```bash
+bash bench/run_bench.sh
+```
+
+本机基线（MinGW g++ 14.2，512 页，64 帧）：
+
+```text
+random_read:   ops=20000 time=147.9 ms throughput=135248 ops/s
+sequential:    ops=5120  time=33.7 ms  throughput=151888 ops/s
+mixed_80_20:   ops=5000  time=459.1 ms throughput=10892 ops/s
+```
+
+混合写吞吐明显低于读，主要因为当前 WAL 每次写页都 fsync。后续如果要优化写路径，可以做 group commit / 批量 fsync。
