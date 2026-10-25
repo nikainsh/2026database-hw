@@ -15,11 +15,20 @@ void LruKPolicy::on_access(Frame &frame)
 
 FrameId LruKPolicy::choose_victim(Frame *frames, size_t frame_count) const
 {
+  return choose_victim(frames, frame_count, [](const Frame &) { return true; });
+}
+
+FrameId LruKPolicy::choose_victim(
+    Frame *frames, size_t frame_count, const std::function<bool(const Frame &)> &allow) const
+{
   FrameId victim        = INVALID_FRAME_ID;
   uint64_t victim_score = 0;
 
   for (size_t i = 0; i < frame_count; ++i) {
     Frame &frame = frames[i];
+    if (!allow(frame)) {
+      continue;
+    }
     if (frame.pin_count() > 0) {
       continue;
     }

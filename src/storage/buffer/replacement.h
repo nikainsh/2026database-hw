@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 #include "common/types.h"
 
@@ -23,8 +24,12 @@ public:
   /// Must be called under DiskBufferPool::meta_mutex_.
   void on_access(Frame &frame);
 
-  /// Must be called under DiskBufferPool::meta_mutex_.
+  /// Must be called under the frame manager lock.
   FrameId choose_victim(Frame *frames, size_t frame_count) const;
+
+  /// Same, but only considers frames accepted by `allow`.
+  FrameId choose_victim(Frame *frames, size_t frame_count,
+                        const std::function<bool(const Frame &)> &allow) const;
 
   int k() const { return k_; }
 

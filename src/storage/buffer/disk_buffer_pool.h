@@ -16,6 +16,7 @@
 #include "common/types.h"
 #include "storage/buffer/buffer_pool_stats.h"
 #include "storage/buffer/frame.h"
+#include "storage/buffer/frame_manager.h"
 #include "storage/buffer/page.h"
 #include "storage/buffer/page_wal.h"
 #include "storage/buffer/replacement.h"
@@ -141,6 +142,7 @@ public:
 
   const std::string &file_name() const { return file_name_; }
   const std::string &wal_file_name() const { return wal_path_; }
+  int                pool_id() const { return pool_id_; }
 
   PageNum page_count() const;
   int32_t free_page_count() const;
@@ -179,6 +181,11 @@ public:
 
 private:
   friend class PageHandle;
+  friend class FrameManager;
+  friend class DiskBufferPoolManager;
+
+  RC open_with_frame_manager(const std::string &path, ReadWriteMode mode, int frame_limit,
+                             bool enable_wal, FrameManager *frame_manager, int pool_id);
 
   RC read_header();
   RC write_header_locked();
@@ -191,18 +198,15 @@ private:
   RC seek(int64_t offset);
   RC sync_data_file();
 
-  RC allocate_frame_locked(FrameId *frame_id);
-  RC flush_frame_locked(Frame &frame);
-
-  void detach_page(PageNum page_num);
+  /// Called by FrameManager while it owns the global frame lock.
+  RC read_page_for_cache(PageNum page_num, char *data);
+  RC flush_frame_data(PageNum page_num, const char *data);
 
   void lock_frame_shared(FrameId frame_id);
   void lock_frame_exclusive(FrameId frame_id);
   void unlock_frame_shared(FrameId frame_id);
   void unlock_frame_exclusive(FrameId frame_id);
   void release_handle();
-
-  Frame *frame_at(FrameId frame_id) const;
 
 private:
   std::string   file_name_;
@@ -215,12 +219,13 @@ private:
   bool          closing_      = false;
 
   DiskFileHeader header_;
-  std::unique_ptr<Frame[]> frames_;
-  int                      frame_limit_ = 0;
-  PageTable                page_table_;
+  int            frame_limit_ = 0;
+  int            pool_id_     = -1;
   std::unordered_set<PageNum> free_pages_;
-  LruKPolicy               replacement_{2};
-  std::unique_ptr<PageWAL> wal_;
+  std::unique_ptr<PageWAL>    wal_;
+
+  FrameManager             *frame_manager_ = nullptr;
+  std::unique_ptr<FrameManager> owned_frame_manager_;
 
   mutable std::mutex meta_mutex_;
   std::mutex         flush_mutex_;
@@ -265,7 +270,9 @@ private:
 private:
   int frame_limit_       = 32;
   int total_frame_limit_ = 4096;
-  int used_frames_       = 0;
+
+  FrameManager frame_manager_;
+  int          next_pool_id_ = 0;
 
   mutable std::mutex mutex_;
   std::vector<std::unique_ptr<DiskBufferPool>> pools_;
