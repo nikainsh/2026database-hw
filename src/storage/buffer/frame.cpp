@@ -6,6 +6,7 @@ void Frame::init(FrameId frame_id)
   frame_id_     = frame_id;
   page_id_      = INVALID_PAGE_NUM;
   pin_count_.store(0, std::memory_order_relaxed);
+  background_pin_count_.store(0, std::memory_order_relaxed);
   dirty_.store(false, std::memory_order_relaxed);
   loading_      = false;
   owner_        = nullptr;
@@ -18,6 +19,7 @@ void Frame::reset()
 {
   page_id_      = INVALID_PAGE_NUM;
   pin_count_.store(0, std::memory_order_relaxed);
+  background_pin_count_.store(0, std::memory_order_relaxed);
   dirty_.store(false, std::memory_order_relaxed);
   loading_      = false;
   access_count_ = 0;
