@@ -113,3 +113,28 @@ Frame latch 在拿到 frame_id 之后单独获取，不和上面几把锁同时�
 - 同一个 pool 的缺页仍被 `meta_mutex_` 串行化。
 - 后台刷脏没有 group commit / 批量 WAL 优化。
 - 预取 worker 是单线程；后续可按 CPU/IO 并发度扩展。
+
+---
+
+## 7. Phase 3：分配元数据持久化
+
+v2 中 `allocate_page` / `dispose_page` 只修改内存 header，header 要等到 flush/checkpoint 才落盘。  
+如果进程在 header 落盘前崩溃，可能丢失最新的页分配/释放信息。
+
+v3 改为：
+
+- `allocate_page` 更新 `first_free_page` / `page_count` 后，立即把 header 页写入 WAL 和数据文件；
+- `dispose_page` 更新 free list 后，同样立即持久化 header；
+- 代价是每次分配/释放多一次 header 页写入。
+
+这样分配元数据在崩溃恢复时不会落后于数据页。
+
+### 尚未做的 durability 项
+
+以下两项需要在数据文件旁边增加 sidecar（如 `.dblwr` / `.chk`），  
+而 `Db::drop_table` 目前只清理 `.heap` / `.index` / `.wal`；新增 sidecar 需要修改 `src/storage/db/db.cpp`，与当前“只改缓冲管理器”的约束冲突，因此暂不启用：
+
+- doublewrite buffer / torn page 防护；
+- 数据页 checksum。
+
+当前页级 full-page WAL 已经能提供 redo；上述两项属于更高等级的介质/崩溃保护，后续如果要启用，需要先确认 sidecar 清理方式。

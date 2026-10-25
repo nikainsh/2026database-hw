@@ -598,7 +598,11 @@ RC DiskBufferPool::allocate_page(PageNum *page_num)
     header_.first_free_page = next_free;
     header_.free_page_count -= 1;
     header_dirty_           = true;
-    *page_num               = reuse;
+    RC header_rc = write_header_locked();
+    if (OB_FAIL(header_rc)) {
+      return header_rc;
+    }
+    *page_num = reuse;
     return RC::SUCCESS;
   }
 
@@ -610,9 +614,13 @@ RC DiskBufferPool::allocate_page(PageNum *page_num)
     return rc;
   }
 
-  *page_num             = new_page;
-  header_.page_count   += 1;
-  header_dirty_         = true;
+  header_.page_count += 1;
+  header_dirty_       = true;
+  RC header_rc = write_header_locked();
+  if (OB_FAIL(header_rc)) {
+    return header_rc;
+  }
+  *page_num = new_page;
   return RC::SUCCESS;
 }
 
@@ -655,7 +663,7 @@ RC DiskBufferPool::dispose_page(PageNum page_num)
   header_.first_free_page = page_num;
   header_.free_page_count += 1;
   header_dirty_           = true;
-  return RC::SUCCESS;
+  return write_header_locked();
 }
 
 RC DiskBufferPool::flush_page(PageNum page_num)
