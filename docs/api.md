@@ -1,4 +1,4 @@
-# 缓冲管理器接口使用说明（v2）
+# 缓冲管理器接口使用说明（v3）
 
 头文件：
 
@@ -77,7 +77,8 @@ rc = bpm.close();
 - 路径会被 `std::filesystem::absolute(...).lexically_normal()` 规范化；
 - 同一路径只会打开一份；
 - 打开时如果已有只读 pool，再请求 READ_WRITE 会返回 `IOERR_ACCESS`；
-- `close_file` / `close` 在仍有未释放 `PageHandle` 时返回 `BUFFERPOOL_HANDLE_BUSY`，并保留 pool。
+- `close_file` / `close` 在仍有未释放 `PageHandle` 时返回 `BUFFERPOOL_HANDLE_BUSY`，并保留 pool；
+- 关闭过程中如果刷脏或移除 frame 所有权失败，同样保留 pool 和 frame，待问题解决后可再次调用 `close`。
 
 ### 2.2 直接使用 DiskBufferPool
 
@@ -252,6 +253,13 @@ RC rc = bpm.close_file(path);   // 现在可以成功
 
 如果 `close` 返回 `BUFFERPOOL_HANDLE_BUSY`，说明还有 handle 没释放。
 
+### 6.4 与 flush / close 的并发
+
+- `close` 会先等待该文件的后台预取/刷脏操作，再刷脏并移除 frame 所有权；
+- 不要在一个线程执行 `close` 的同时从其他线程调用 `flush_page`、`flush_all_buffers` 或 `checkpoint`；
+- `close` 失败时 pool 仍保持打开、frame 所有权不变，修复 I/O 或释放句柄后可以重试；
+- 建议由管理生命周期的线程统一执行 flush 和 close。
+
 ---
 
 ## 7. 只读模式
@@ -292,7 +300,8 @@ pool->checkpoint();            // 同上
   4. 如果还有 dirty frame，不截断 WAL；
   5. fsync 数据文件；
   6. checkpoint 截断 WAL。
-- `close` 内部会调用 flush/checkpoint。
+- `close` 内部会调用 flush/checkpoint；失败时不会清空 frame manager 或关闭文件，可以修复 I/O 后重试。
+- `allocate_page` / `dispose_page` 把 header 和对应数据页作为**一条两页 WAL record** 写入，恢复时两页一起重放。
 
 WAL 文件：
 
@@ -355,11 +364,11 @@ v3 起是**异步预取**：
 DiskBufferPoolManager bpm(32, 4096);
 ```
 
-- 每文件最多 32 帧；
-- 所有打开文件合计最多 4096 帧；
-- 打开新文件时，实际帧数 = `min(32, 剩余全局帧数)`；
-- 剩余不足 1 帧时返回 `BUFFERPOOL_NOBUF`；
-- 淘汰仍是 per-file；真正全局 frame manager 是后续工作。
+- 所有打开文件共享一个全局 frame 池，总帧数上限为 4096；
+- 每个文件最多占用 32 帧，防止单个文件挤占全局池；
+- 页表和 LRU-K 都是全局的，victim 可以来自任意文件；
+- 文件配额已满时，只在当前文件的帧中选择 victim；否则全局选择；
+- 打开文件本身不预分配帧；真正无空闲且无可淘汰帧时，`get_page_*` 才返回 `BUFFERPOOL_NOBUF`。
 
 查询：
 
@@ -381,7 +390,7 @@ bpm.remaining_frames();
 | `BUFFERPOOL_PAGE_FREED` | 访问已释放页；检查 RID/页号是否失效 |
 | `BUFFERPOOL_CORRUPTED` | header CRC / free list / 短读等；文件可能损坏 |
 | `BUFFERPOOL_WAL_ERROR` | WAL 打开/回放/只读恢复失败 |
-| `BUFFERPOOL_NOBUF` | 所有帧都被 pin 或全局预算耗尽 |
+| `BUFFERPOOL_NOBUF` | 全局帧池没有空闲帧，且所有帧都被 pin / 正在加载，无法淘汰 |
 | `BUFFERPOOL_PAGE_PINNED` | 释放被 pin 的页；先释放 handle |
 
 ---

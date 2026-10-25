@@ -73,6 +73,64 @@ static void test_append_replay_checkpoint()
   }
 }
 
+static void test_two_page_atomic_record()
+{
+  remove_files();
+  assert(OB_SUCC(path_mkdir_recursive(kDir)));
+
+  char page_a[BP_PAGE_SIZE];
+  char page_b[BP_PAGE_SIZE];
+  fill_page(page_a, 31);
+  fill_page(page_b, 32);
+
+  {
+    PageWAL wal(kWal);
+    assert(OB_SUCC(wal.open(true)));
+    assert(OB_SUCC(wal.append_two_pages_and_sync(5, page_a, 6, page_b)));
+    assert(wal.last_lsn() == 1);
+    assert(OB_SUCC(wal.close()));
+  }
+
+  {
+    PageWAL wal(kWal);
+    assert(OB_SUCC(wal.open(false)));
+    std::map<PageNum, std::string> restored;
+    assert(OB_SUCC(wal.replay([&](PageNum page_num, const char *data) {
+      restored[page_num] = std::string(data, BP_PAGE_SIZE);
+      return RC::SUCCESS;
+    })));
+    assert(restored.size() == 2);
+    check_page(restored[5].data(), 31);
+    check_page(restored[6].data(), 32);
+    assert(OB_SUCC(wal.close()));
+  }
+
+  /// Corrupting the second page invalidates the whole record, so neither page
+  /// may be replayed.
+  const long second_page_offset = 16 + 32 + BP_PAGE_SIZE + 10;
+  FILE      *fp                 = fopen(kWal.c_str(), "r+b");
+  assert(fp != nullptr);
+  assert(fseek(fp, second_page_offset, SEEK_SET) == 0);
+  int byte = 0;
+  assert(fread(&byte, 1, 1, fp) == 1);
+  byte ^= 0xFF;
+  assert(fseek(fp, second_page_offset, SEEK_SET) == 0);
+  assert(fwrite(&byte, 1, 1, fp) == 1);
+  fclose(fp);
+
+  {
+    PageWAL wal(kWal);
+    assert(OB_SUCC(wal.open(false)));
+    int count = 0;
+    assert(OB_SUCC(wal.replay([&](PageNum, const char *) {
+      ++count;
+      return RC::SUCCESS;
+    })));
+    assert(count == 0);
+    assert(OB_SUCC(wal.close()));
+  }
+}
+
 static void test_torn_tail()
 {
   remove_files();
@@ -152,6 +210,7 @@ static void test_crc_corruption_stops_replay()
 int main()
 {
   test_append_replay_checkpoint();
+  test_two_page_atomic_record();
   test_torn_tail();
   test_crc_corruption_stops_replay();
   remove_files();

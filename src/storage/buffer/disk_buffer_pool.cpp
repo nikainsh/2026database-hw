@@ -320,10 +320,24 @@ RC DiskBufferPool::close()
   }
 
   RC rc = flush_all_buffers();
+  if (OB_FAIL(rc)) {
+    if (frame_manager_ != nullptr) {
+      frame_manager_->resume_owner(this);
+    }
+    std::lock_guard<std::mutex> guard(meta_mutex_);
+    closing_ = false;
+    return rc;
+  }
+
   if (frame_manager_ != nullptr) {
     RC remove_rc = frame_manager_->remove_owner(this);
-    if (OB_FAIL(remove_rc) && OB_SUCC(rc)) {
-      rc = remove_rc;
+    if (OB_FAIL(remove_rc)) {
+      /// Keep the file open and the frame ownership intact so a later close()
+      /// can retry instead of touching an owner that is still registered.
+      frame_manager_->resume_owner(this);
+      std::lock_guard<std::mutex> guard(meta_mutex_);
+      closing_ = false;
+      return remove_rc;
     }
   }
 
@@ -507,6 +521,36 @@ RC DiskBufferPool::write_page_with_wal(PageNum page_num, const char *data)
   return rc;
 }
 
+RC DiskBufferPool::write_two_pages_with_wal(PageNum page_a, const char *data_a,
+                                              PageNum page_b, const char *data_b)
+{
+  /// A single WAL record makes the allocation/disposal of a page atomic with
+  /// the header update. Without it a crash can expose a page that the header
+  /// does not know about (or a free page that is still reachable).
+  std::lock_guard<std::mutex> flush_guard(flush_mutex_);
+  if (wal_) {
+    RC rc = wal_->append_two_pages_and_sync(page_a, data_a, page_b, data_b);
+    if (OB_FAIL(rc)) {
+      LOG_ERROR("WAL append failed. file=%s, page_a=%d, page_b=%d, rc=%s",
+                file_name_.c_str(), page_a, page_b, strrc(rc));
+      return rc;
+    }
+    stats_.wal_writes.fetch_add(1, std::memory_order_relaxed);
+    stats_.wal_syncs.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  RC rc = write_page_raw(page_a, data_a);
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+  rc = write_page_raw(page_b, data_b);
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+  stats_.writes.fetch_add(2, std::memory_order_relaxed);
+  return RC::SUCCESS;
+}
+
 RC DiskBufferPool::sync_data_file()
 {
   if (handle_ == nullptr) {
@@ -575,6 +619,16 @@ RC DiskBufferPool::allocate_page(PageNum *page_num)
       return RC::BUFFERPOOL_CORRUPTED;
     }
 
+    /// A prefetch may have queued this page before it was freed. Cancel it and
+    /// drop any stale cached frame before reusing the page.
+    if (frame_manager_ != nullptr) {
+      frame_manager_->cancel_prefetch(this, reuse);
+      RC remove_rc = frame_manager_->remove_page(this, reuse);
+      if (OB_FAIL(remove_rc)) {
+        return remove_rc;
+      }
+    }
+
     char raw[BP_PAGE_SIZE];
     RC   rc = read_page_raw(reuse, raw);
     if (OB_FAIL(rc)) {
@@ -588,39 +642,41 @@ RC DiskBufferPool::allocate_page(PageNum *page_num)
       stats_.corrupted.fetch_add(1, std::memory_order_relaxed);
       return RC::BUFFERPOOL_CORRUPTED;
     }
+    DiskFileHeader new_header           = header_;
+    new_header.first_free_page          = next_free;
+    new_header.free_page_count         -= 1;
+    char header_page[BP_PAGE_SIZE];
+    encode_header(new_header, header_page);
     memset(raw, 0, sizeof(raw));
-    rc = write_page_with_wal(reuse, raw);
+
+    /// Persist the new header and the cleared page in one WAL record.
+    rc = write_two_pages_with_wal(BP_HEADER_PAGE, header_page, reuse, raw);
     if (OB_FAIL(rc)) {
       return rc;
     }
 
     free_pages_.erase(reuse);
-    header_.first_free_page = next_free;
-    header_.free_page_count -= 1;
-    header_dirty_           = true;
-    RC header_rc = write_header_locked();
-    if (OB_FAIL(header_rc)) {
-      return header_rc;
-    }
-    *page_num = reuse;
+    header_       = new_header;
+    header_dirty_ = false;
+    *page_num     = reuse;
     return RC::SUCCESS;
   }
 
   const PageNum new_page = header_.page_count;
-  char          raw[BP_PAGE_SIZE];
+  DiskFileHeader new_header = header_;
+  new_header.page_count += 1;
+  char header_page[BP_PAGE_SIZE];
+  encode_header(new_header, header_page);
+  char raw[BP_PAGE_SIZE];
   memset(raw, 0, sizeof(raw));
-  RC rc = write_page_with_wal(new_page, raw);
+  RC rc = write_two_pages_with_wal(BP_HEADER_PAGE, header_page, new_page, raw);
   if (OB_FAIL(rc)) {
     return rc;
   }
 
-  header_.page_count += 1;
-  header_dirty_       = true;
-  RC header_rc = write_header_locked();
-  if (OB_FAIL(header_rc)) {
-    return header_rc;
-  }
-  *page_num = new_page;
+  header_       = new_header;
+  header_dirty_ = false;
+  *page_num     = new_page;
   return RC::SUCCESS;
 }
 
@@ -642,6 +698,7 @@ RC DiskBufferPool::dispose_page(PageNum page_num)
   }
 
   if (frame_manager_ != nullptr) {
+    frame_manager_->cancel_prefetch(this, page_num);
     RC rc = frame_manager_->remove_page(this, page_num);
     if (OB_FAIL(rc)) {
       if (rc == RC::BUFFERPOOL_PAGE_PINNED) {
@@ -651,19 +708,24 @@ RC DiskBufferPool::dispose_page(PageNum page_num)
     }
   }
 
+  DiskFileHeader new_header           = header_;
+  new_header.first_free_page          = page_num;
+  new_header.free_page_count         += 1;
+  char header_page[BP_PAGE_SIZE];
+  encode_header(new_header, header_page);
+
   char raw[BP_PAGE_SIZE];
   memset(raw, 0, sizeof(raw));
   memcpy(raw, &header_.first_free_page, sizeof(header_.first_free_page));
-  RC rc = write_page_with_wal(page_num, raw);
+  RC rc = write_two_pages_with_wal(BP_HEADER_PAGE, header_page, page_num, raw);
   if (OB_FAIL(rc)) {
     return rc;
   }
 
   free_pages_.insert(page_num);
-  header_.first_free_page = page_num;
-  header_.free_page_count += 1;
-  header_dirty_           = true;
-  return write_header_locked();
+  header_       = new_header;
+  header_dirty_ = false;
+  return RC::SUCCESS;
 }
 
 RC DiskBufferPool::flush_page(PageNum page_num)

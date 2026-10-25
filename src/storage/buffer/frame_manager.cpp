@@ -39,6 +39,7 @@ void FrameManager::worker_loop()
           prefetch_pending_.erase(page_key(request.owner, request.page));
           continue;
         }
+        prefetch_active_.insert(page_key(request.owner, request.page));
         ++owner_active_ops_[request.owner];
         has_request = true;
       }
@@ -52,7 +53,9 @@ void FrameManager::worker_loop()
       }
 
       std::lock_guard<std::mutex> lock(mutex_);
-      prefetch_pending_.erase(page_key(request.owner, request.page));
+      const uint64_t key = page_key(request.owner, request.page);
+      prefetch_pending_.erase(key);
+      prefetch_active_.erase(key);
       auto iter = owner_active_ops_.find(request.owner);
       if (iter != owner_active_ops_.end()) {
         if (--iter->second == 0) {
@@ -153,6 +156,27 @@ void FrameManager::cancel_owner(DiskBufferPool *owner)
   while (active != owner_active_ops_.end() && active->second > 0) {
     cv_.wait(lock);
     active = owner_active_ops_.find(owner);
+  }
+}
+
+void FrameManager::cancel_prefetch(DiskBufferPool *owner, PageNum page)
+{
+  if (owner == nullptr) {
+    return;
+  }
+  const uint64_t key = page_key(owner, page);
+  std::unique_lock<std::mutex> lock(mutex_);
+
+  for (auto iter = prefetch_queue_.begin(); iter != prefetch_queue_.end();) {
+    if (iter->owner == owner && iter->page == page) {
+      prefetch_pending_.erase(key);
+      iter = prefetch_queue_.erase(iter);
+    } else {
+      ++iter;
+    }
+  }
+  while (prefetch_active_.count(key) > 0) {
+    cv_.wait(lock);
   }
 }
 
@@ -471,6 +495,12 @@ RC FrameManager::remove_owner(DiskBufferPool *owner)
       }
     }
     page_table_.erase(page_key(owner, frame.page_id()));
+    auto count_iter = owner_frame_counts_.find(owner);
+    if (count_iter != owner_frame_counts_.end()) {
+      if (--count_iter->second == 0) {
+        owner_frame_counts_.erase(count_iter);
+      }
+    }
     frame.reset();
     frame.set_owner(nullptr);
     --used_frames_;
@@ -478,6 +508,15 @@ RC FrameManager::remove_owner(DiskBufferPool *owner)
   owner_frame_counts_.erase(owner);
   closing_owners_.erase(owner);
   return rc;
+}
+
+void FrameManager::resume_owner(DiskBufferPool *owner)
+{
+  if (owner == nullptr) {
+    return;
+  }
+  std::lock_guard<std::mutex> guard(mutex_);
+  closing_owners_.erase(owner);
 }
 
 RC FrameManager::unpin(FrameId frame_id, bool background)
