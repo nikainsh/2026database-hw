@@ -42,6 +42,8 @@ public:
   LogicalOperatorKind kind() const { return kind_; }
 
   const std::vector<std::unique_ptr<LogicalOperator>> &children() const { return children_; }
+  /// 只有优化器改写计划树（重排连接顺序）时才用
+  std::vector<std::unique_ptr<LogicalOperator>>       &mutable_children() { return children_; }
   void                                                add_child(std::unique_ptr<LogicalOperator> child)
   {
     children_.push_back(std::move(child));
@@ -135,16 +137,34 @@ private:
   bool                      always_false_ = false;
 };
 
-/// 多表连接：children 是各张表的扫描；连接条件留在上层 predicate 里过滤
+/// 多表连接：children 是各张表的扫描；on_conditions 是需要两侧才能算的等值条件
 class JoinOperator : public LogicalOperator
 {
 public:
   JoinOperator() : LogicalOperator(LogicalOperatorKind::JOIN) {}
 
+  const std::vector<Expression *> &on_conditions() const { return on_conditions_; }
+  void                             add_on_condition(Expression *condition) { on_conditions_.push_back(condition); }
+
   std::string describe() const override
   {
-    return "join(" + std::to_string(children_.size()) + " tables, nested loop)";
+    std::string text = "join(" + std::to_string(children_.size()) + " tables";
+    if (on_conditions_.empty()) {
+      text += ", cross";
+    } else {
+      text += ", on ";
+      for (size_t i = 0; i < on_conditions_.size(); ++i) {
+        if (i > 0) {
+          text += " and ";
+        }
+        text += on_conditions_[i]->describe();
+      }
+    }
+    return text + ")";
   }
+
+private:
+  std::vector<Expression *> on_conditions_;
 };
 
 /// 投影：select 列表
