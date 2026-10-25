@@ -91,6 +91,24 @@ RC TableScanOperator::next(Tuple *&tuple)
 // IndexScan
 // ---------------------------------------------------------------------------
 
+RC IndexScanOperator::set_parameters(const Tuple &outer)
+{
+  if (join_key_.table_index < 0) {
+    return RC::SUCCESS;
+  }
+  Value key;
+  if (!outer.get(join_key_, key)) {
+    LOG_WARN("join key column missing in outer tuple. table=%s, ref=(%d,%d)", table_->table_name().c_str(),
+             join_key_.table_index, join_key_.column_index);
+    return RC::SCHEMA_FIELD_NOT_EXIST;
+  }
+
+  range_.has_low = range_.has_high = true;
+  range_.low_inclusive = range_.high_inclusive = true;
+  range_.low = range_.high                      = key;
+  return RC::SUCCESS;
+}
+
 RC IndexScanOperator::open()
 {
   affected_rows_ = 0;

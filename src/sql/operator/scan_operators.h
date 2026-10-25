@@ -60,6 +60,9 @@ private:
  * @brief 索引扫描：按 B+Tree 的范围游标取 RID，再回表拿完整记录
  * @details 对应 miniob 的 IndexScanPhysicalOperator。回表是随机 I/O，
  *          所以优化器只在「等值或窄范围」时才选它。
+ *          另一种用法是索引嵌套循环连接：连接键不在计划里写死，而是每轮由外层元组
+ *          通过 set_parameters() 填进来（table_index>=0 的 join_key_），此时 range_
+ *          在被填之前是空的，也就退化成整棵树的扫描，结果依然正确。
  */
 class IndexScanOperator : public PhysicalOperator
 {
@@ -69,6 +72,10 @@ public:
       : table_(table), index_(index), filters_(std::move(filters)), range_(range), table_index_(table_index)
   {}
 
+  /// 连接键取外层元组的哪一列（table_index 为 -1 表示不启用）
+  void set_join_key(const ColumnRef &outer_column) { join_key_ = outer_column; }
+  RC   set_parameters(const Tuple &outer) override;
+
   PhysicalOperatorKind kind() const override { return PhysicalOperatorKind::INDEX_SCAN; }
   RC                   open() override;
   RC                   next(Tuple *&tuple) override;
@@ -76,6 +83,9 @@ public:
   std::string          describe() const override
   {
     std::string text = "index_scan(" + table_->table_name() + "." + index_->index_meta().index_name + ")";
+    if (join_key_.table_index >= 0) {
+      text += " join_lookup";
+    }
     if (range_.has_low) {
       text += " low=" + range_.low.to_string() + (range_.low_inclusive ? "(closed)" : "(open)");
     }
@@ -97,6 +107,7 @@ private:
   std::vector<Expression *>  filters_;
   IndexScanRange              range_;
   int                         table_index_ = 0;
+  ColumnRef                   join_key_;
 
   BplusTreeScanner scanner_;
   Tuple            tuple_;

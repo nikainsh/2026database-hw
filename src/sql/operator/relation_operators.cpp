@@ -14,7 +14,7 @@ RC FilterPhysicalOperator::open()
   if (children_.empty()) {
     return RC::INTERNAL;
   }
-  return children_[0]->open_tracked();
+  return children_[0]->open();
 }
 
 RC FilterPhysicalOperator::next(Tuple *&tuple)
@@ -25,7 +25,7 @@ RC FilterPhysicalOperator::next(Tuple *&tuple)
 
   while (true) {
     Tuple *child_tuple = nullptr;
-    RC    rc           = children_[0]->next_tracked(child_tuple);
+    RC    rc           = children_[0]->next(child_tuple);
     if (rc != RC::SUCCESS) {
       return rc;
     }
@@ -72,7 +72,7 @@ RC NestedLoopJoinOperator::open()
   left_eof_   = false;
   left_tuple_.clear();
   joined_.clear();
-  RC rc = children_[0]->open_tracked();
+  RC rc = children_[0]->open();
   left_opened_ = OB_SUCC(rc);
   return rc;
 }
@@ -82,11 +82,11 @@ RC NestedLoopJoinOperator::close()
   RC rc = RC::SUCCESS;
   // 逆序收尾。即使右侧关闭报错，也继续关闭左侧并保留最先的错误。
   if (right_opened_) {
-    rc = children_[1]->close_tracked();
+    rc = children_[1]->close();
     right_opened_ = false;
   }
   if (left_opened_) {
-    RC one = children_[0]->close_tracked();
+    RC one = children_[0]->close();
     left_opened_ = false;
     if (OB_SUCC(rc)) rc = one;
   }
@@ -110,7 +110,7 @@ RC NestedLoopJoinOperator::next(Tuple *&tuple)
     /// 取一条左边的行，然后重新打开右边
     if (!left_ready_) {
       Tuple *left = nullptr;
-      RC    rc    = children_[0]->next_tracked(left);
+      RC    rc    = children_[0]->next(left);
       if (rc == RC::RECORD_EOF) {
         left_eof_ = true;
         return RC::RECORD_EOF;
@@ -121,7 +121,13 @@ RC NestedLoopJoinOperator::next(Tuple *&tuple)
       left_tuple_ = *left;  /// 复制一份：子算子会复用它的缓冲区
       left_ready_ = true;
 
-      rc = children_[1]->open_tracked();
+      RC param_rc = children_[1]->set_parameters(left_tuple_);
+      if (OB_FAIL(param_rc)) {
+        left_eof_   = true;
+        return param_rc;
+      }
+
+      rc = children_[1]->open();
       if (OB_FAIL(rc)) {
         left_eof_ = true;  // 错误后不再访问未成功打开的右侧，等待 close。
         return rc;
@@ -130,9 +136,9 @@ RC NestedLoopJoinOperator::next(Tuple *&tuple)
     }
 
     Tuple *right = nullptr;
-    RC    rc   = children_[1]->next_tracked(right);
+    RC    rc   = children_[1]->next(right);
     if (rc == RC::RECORD_EOF) {
-      rc = children_[1]->close_tracked();
+      rc = children_[1]->close();
       right_opened_ = false;
       left_ready_ = false;
       if (OB_FAIL(rc)) {
@@ -146,21 +152,25 @@ RC NestedLoopJoinOperator::next(Tuple *&tuple)
     }
 
     joined_.clear();
-    count_candidate_pair();
     joined_.append_all(left_tuple_);
     joined_.append_all(*right);
     joined_.rid        = left_tuple_.rid;
     joined_.has_rid    = left_tuple_.has_rid;
 
-    if (on_condition_ != nullptr) {
+    bool pass = true;
+    for (Expression *on_condition : on_conditions_) {
       Value result;
-      rc = on_condition_->evaluate(joined_, result);
+      rc = on_condition->evaluate(joined_, result);
       if (OB_FAIL(rc)) {
         return rc;
       }
       if (!result.get_bool()) {
-        continue;
+        pass = false;
+        break;
       }
+    }
+    if (!pass) {
+      continue;
     }
 
     tuple = &joined_;
@@ -177,14 +187,13 @@ RC ProjectPhysicalOperator::open()
   if (children_.empty()) {
     return RC::INTERNAL;
   }
-  return children_[0]->open_tracked();
+  return children_[0]->open();
 }
 
 RC ProjectPhysicalOperator::next(Tuple *&tuple)
 {
-  if (children_.empty()) return RC::INTERNAL;
   Tuple *child_tuple = nullptr;
-  RC    rc          = children_[0]->next_tracked(child_tuple);
+  RC    rc          = children_[0]->next(child_tuple);
   if (rc != RC::SUCCESS) {
     return rc;
   }

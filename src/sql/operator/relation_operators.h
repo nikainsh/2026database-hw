@@ -38,13 +38,15 @@ private:
 
 /**
  * @brief 嵌套循环连接：对左边的每一行，把右边完整扫一遍
- * @details 对应 miniob 的 NestedLoopJoinPhysicalOperator。join 条件为空时就是笛卡尔积。
+ * @details 对应 miniob 的 NestedLoopJoinPhysicalOperator。连接条件为空时就是笛卡尔积。
  *          元组用「每列自带来源」的方式拼接，所以两边的列都能被上层表达式按 (table,col) 找到。
+ *          每换一行左边会先给右边调 set_parameters：右边若是按连接键查的索引扫描，
+ *          就把它换成「索引嵌套循环连接」，代价从 左×右 降到 左×log(右)。
  */
 class NestedLoopJoinOperator : public PhysicalOperator
 {
 public:
-  explicit NestedLoopJoinOperator(Expression *on_condition) : on_condition_(on_condition) {}
+  explicit NestedLoopJoinOperator(std::vector<Expression *> on_conditions) : on_conditions_(std::move(on_conditions)) {}
 
   PhysicalOperatorKind kind() const override { return PhysicalOperatorKind::NESTED_LOOP_JOIN; }
   RC                   open() override;
@@ -52,11 +54,19 @@ public:
   RC                   close() override;
   std::string          describe() const override
   {
-    return "nested_loop_join" + (on_condition_ != nullptr ? " on=" + on_condition_->describe() : std::string(" (cross)"));
+    std::string text = "nested_loop_join";
+    if (on_conditions_.empty()) {
+      return text + " (cross)";
+    }
+    for (size_t i = 0; i < on_conditions_.size(); ++i) {
+      text += (i == 0 ? " on=" : " and ");
+      text += on_conditions_[i]->describe();
+    }
+    return text;
   }
 
 private:
-  Expression *on_condition_ = nullptr;
+  std::vector<Expression *> on_conditions_;
 
   Tuple left_tuple_;
   Tuple joined_;
