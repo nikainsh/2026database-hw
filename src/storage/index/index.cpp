@@ -98,3 +98,32 @@ RC BplusTreeIndex::entry_count(int64_t &count) const
   count = tree_.entry_count();
   return RC::SUCCESS;
 }
+
+RC BplusTreeIndex::collect_stats(IndexStats &stats) const
+{
+  int64_t entries       = 0;
+  int64_t distinct_keys = 0;
+  std::string min_key, max_key;
+
+  RC rc = tree_.collect_stats(entries, distinct_keys, min_key, max_key);
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+
+  stats.valid         = true;
+  stats.entries       = entries;
+  stats.distinct_keys = distinct_keys;
+  stats.min_key       = min_key;
+  stats.max_key       = max_key;
+  return RC::SUCCESS;
+}
+
+RC Index::decode_key(const std::string &key, Value &value) const
+{
+  if (column_ == nullptr || static_cast<int>(key.size()) != column_->data_len()) {
+    return RC::INVALID_ARGUMENT;
+  }
+  value = Value();
+  value.set_type(column_->type());
+  return value.unpack_from(key.data(), column_->data_len());
+}

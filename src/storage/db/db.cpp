@@ -11,7 +11,7 @@
 #include "common/log.h"
 
 static constexpr int32_t CATALOG_MAGIC   = 0x4D444243;  /// 'MDBC'
-static constexpr int32_t CATALOG_VERSION = 1;
+static constexpr int32_t CATALOG_VERSION = 2;           /// v2：索引统计信息；v1 仍可读取（无统计）
 
 std::string catalog_file_path(const std::string &db_path) { return path_join(db_path, "catalog.bin"); }
 
@@ -94,10 +94,14 @@ RC Db::load_catalog()
   }
 
   BinaryReader reader(reinterpret_cast<const uint8_t *>(buffer.data()), buffer.size());
-  if (reader.get_i32() != CATALOG_MAGIC || reader.get_i32() != CATALOG_VERSION) {
+  const int32_t magic  = reader.get_i32();
+  const int32_t version = reader.get_i32();
+  if (magic != CATALOG_MAGIC || version < 1 || version > CATALOG_VERSION) {
     LOG_ERROR("invalid catalog file. path=%s", path.c_str());
     return RC::IOERR_READ;
   }
+  /// v1 的 catalog 里没有索引统计信息
+  const bool with_stats = version >= 2;
 
   const int32_t count = reader.get_i32();
   if (!reader.ok() || count < 0 || count > 65536) {
@@ -107,7 +111,7 @@ RC Db::load_catalog()
   tables_.clear();
   for (int32_t i = 0; i < count; ++i) {
     TableMeta meta;
-    RC        rc = TableMeta::deserialize(reader, meta);
+    RC        rc = TableMeta::deserialize(reader, meta, with_stats);
     if (OB_FAIL(rc)) {
       LOG_ERROR("failed to parse table meta in catalog. table_index=%d, rc=%s", i, strrc(rc));
       return rc;

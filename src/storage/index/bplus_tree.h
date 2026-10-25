@@ -65,6 +65,8 @@ public:
 
 private:
   RC move_to_next_leaf();
+  /// 回退到最左一个可能包含 left_key_ 的叶子：重复键的条目可能被叶子分裂散到左侧叶子上
+  RC rewind_to_leftmost_match();
 
   BplusTree *tree_ = nullptr;
   std::string left_key_, right_key_;
@@ -109,6 +111,8 @@ public:
                   const char *right_key, bool right_inclusive) const;
 
   int64_t entry_count() const { return header_.entry_count; }
+  /// 沿叶子链统计：条目数、不同键数、最小/最大键。供优化器估算选择率使用。
+  RC collect_stats(int64_t &entries, int64_t &distinct_keys, std::string &min_key, std::string &max_key) const;
   int     key_len() const { return header_.key_len; }
   bool    unique() const { return header_.unique_flag != 0; }
   AttrType key_type() const { return static_cast<AttrType>(header_.key_type); }

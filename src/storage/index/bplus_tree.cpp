@@ -674,6 +674,58 @@ RC BplusTree::entry_exists_locked(const char *key, bool &exists) const
   return rc;
 }
 
+RC BplusTree::collect_stats(int64_t &entries, int64_t &distinct_keys, std::string &min_key, std::string &max_key) const
+{
+  entries       = 0;
+  distinct_keys = 0;
+  min_key.clear();
+  max_key.clear();
+
+  if (!opened_) {
+    return RC::RECORD_OPENNED;
+  }
+  std::shared_lock<std::shared_mutex> tree_guard(latch_);
+
+  std::string previous;
+  bool        has_previous = false;
+  PageNum     page_num     = header_.first_leaf_page;
+  while (page_num != INVALID_PAGE_NUM) {
+    PageHandle handle;
+    RC         rc = buffer_pool_->get_page_read(page_num, handle);
+    if (OB_FAIL(rc)) {
+      return rc;
+    }
+
+    const char *node = handle.const_data();
+    if (!is_leaf_page(node)) {
+      LOG_ERROR("leaf chain contains an internal node. file=%s, page=%d", file_name_.c_str(), page_num);
+      return RC::INTERNAL;
+    }
+
+    const int32_t count = node_key_count(node);
+    for (int32_t i = 0; i < count; ++i) {
+      std::string key;
+      key.assign(leaf_key_at(node, i), static_cast<size_t>(header_.key_len));
+      if (!has_previous) {
+        min_key       = key;
+        distinct_keys = 1;  /// 第一个键本身也算一个不同值
+      } else if (compare_keys(key.c_str(), previous.c_str()) != 0) {
+        distinct_keys += 1;
+      }
+      previous     = key;
+      has_previous = true;
+      entries += 1;
+    }
+
+    const PageNum next = page_header(node)->next_leaf;
+    handle.reset();
+    page_num = next;
+  }
+
+  max_key = previous;
+  return RC::SUCCESS;
+}
+
 // ---------------------------------------------------------------------------
 // 删除
 // ---------------------------------------------------------------------------
@@ -1210,6 +1262,10 @@ RC BplusTreeScanner::init(BplusTree *tree,
     if (OB_FAIL(rc)) {
       return rc;
     }
+    rc = rewind_to_leftmost_match();
+    if (OB_FAIL(rc)) {
+      return rc;
+    }
     current_slot_ = 0;
   }
 
@@ -1220,13 +1276,52 @@ RC BplusTreeScanner::init(BplusTree *tree,
   return RC::SUCCESS;
 }
 
+/**
+ * @brief 回退到最左一个可能包含 left_key_ 的叶子
+ * @details find_leaf 用 upper_bound 下降，落在重复键所在的最右叶子；同一个键的条目可能被
+ *          叶子分裂散到左侧叶子上，只向右走会漏行（实测：非唯一索引上 cat = 7 命中 3 个
+ *          叶子时，200 万行数据只返回最后一片的 543 条）。这里沿 prev_leaf 回退，
+ *          直到某个叶子的最小键已经小于目标键为止——更左的叶子不可能再包含目标键。
+ */
+RC BplusTreeScanner::rewind_to_leftmost_match()
+{
+  if (left_key_.empty()) {
+    current_page_ = tree_->header_.first_leaf_page;
+    return RC::SUCCESS;
+  }
+
+  while (true) {
+    PageHandle probe;
+    RC         rc = tree_->buffer_pool_->get_page_read(current_page_, probe);
+    if (OB_FAIL(rc)) {
+      return rc;
+    }
+
+    const char  *page   = probe.const_data();
+    const int32_t count = tree_->node_key_count(page);
+    if (count <= 0 || tree_->compare_keys(tree_->leaf_key_at(page, 0), left_key_.c_str()) < 0) {
+      return RC::SUCCESS;  /// 已经到最左可能包含目标键的叶子
+    }
+    const PageNum prev = BplusTree::page_header(page)->prev_leaf;
+    if (prev == INVALID_PAGE_NUM) {
+      return RC::SUCCESS;
+    }
+    probe.reset();
+    current_page_ = prev;
+  }
+}
+
 RC BplusTreeScanner::restart()
 {
   handle_.reset();
   finished_     = false;
   current_slot_ = 0;
   if (!left_key_.empty()) {
-    return tree_->find_leaf(left_key_.c_str(), &current_page_);
+    RC rc = tree_->find_leaf(left_key_.c_str(), &current_page_);
+    if (OB_FAIL(rc)) {
+      return rc;
+    }
+    return rewind_to_leftmost_match();
   }
   current_page_ = tree_->header_.first_leaf_page;
   return RC::SUCCESS;

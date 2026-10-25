@@ -143,6 +143,38 @@ RC Table::start_scan(RecordScanner &scanner) { return scanner.init(record_manage
 
 RC Table::record_count(int64_t &count) { return record_manager_->get_record_count(count); }
 
+RC Table::ensure_index_stats()
+{
+  for (const IndexMeta &meta : meta_.indexes()) {
+    Index             *index = index_by_name(meta.index_name);
+    if (index == nullptr) {
+      continue;
+    }
+
+    const IndexStats *existing = meta_.index_stats(meta.index_name);
+    if (existing != nullptr && existing->valid) {
+      /// 条目数是 O(1) 的实时值；NDV 与最小最大键沿用上次采集（本实现不做自动失效）
+      IndexStats fresh  = *existing;
+      int64_t    entries = 0;
+      if (OB_SUCC(index->entry_count(entries))) {
+        fresh.entries = entries;
+        meta_.set_index_stats(meta.index_name, fresh);
+      }
+      continue;
+    }
+
+    IndexStats stats;
+    RC         rc = index->collect_stats(stats);
+    if (OB_FAIL(rc)) {
+      LOG_WARN("failed to collect index stats. table=%s, index=%s, rc=%s",
+               meta_.table_name().c_str(), meta.index_name.c_str(), strrc(rc));
+      return rc;
+    }
+    meta_.set_index_stats(meta.index_name, stats);
+  }
+  return RC::SUCCESS;
+}
+
 RC Table::create_index(const IndexMeta &meta, bool replay_data)
 {
   RC rc = meta_.add_index(meta);

@@ -10,6 +10,19 @@
 #include "common/value.h"
 #include "storage/record/record.h"
 
+/// 索引统计信息：优化器用来估算选择率。键以索引原始字节形式保存。
+struct IndexStats
+{
+  bool        valid         = false;
+  int64_t     entries       = 0;  /// 索引条目数
+  int64_t     distinct_keys = 0;  /// 不同键数（NDV）
+  std::string min_key;
+  std::string max_key;
+
+  void serialize(BinaryWriter &w) const;
+  static RC deserialize(BinaryReader &r, IndexStats &stats);
+};
+
 /// 索引元数据：本实现一个索引只覆盖一个字段（与 miniob 的简化一致）
 struct IndexMeta
 {
@@ -75,6 +88,10 @@ public:
   RC                add_index(const IndexMeta &meta);
   RC                remove_index(const std::string &index_name);
 
+  /// 索引统计信息，与 indexes_ 同下标；未采集时 valid=false
+  RC                set_index_stats(const std::string &index_name, const IndexStats &stats);
+  const IndexStats *index_stats(const std::string &index_name) const;
+
   /// 把一组值按列顺序打包成一条记录（会做类型转换与长度检查）
   RC make_record(const std::vector<Value> &values, Record &record) const;
   /// 从记录里取出某一列的值
@@ -83,7 +100,8 @@ public:
   const char *field_data(const Record &record, const ColumnMeta &column) const;
 
   void serialize(BinaryWriter &w) const;
-  static RC deserialize(BinaryReader &r, TableMeta &meta);
+  /// with_stats=false 用来读取尚未保存统计信息的老 catalog
+  static RC deserialize(BinaryReader &r, TableMeta &meta, bool with_stats = true);
 
   std::string to_string() const;
 
@@ -91,5 +109,6 @@ private:
   std::string             table_name_;
   std::vector<ColumnMeta> columns_;
   std::vector<IndexMeta>  indexes_;
+  std::vector<IndexStats> index_stats_;  /// 与 indexes_ 同下标
   int                     record_size_ = 0;
 };

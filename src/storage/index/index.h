@@ -34,6 +34,11 @@ public:
                           const Value *low, bool low_inclusive,
                           const Value *high, bool high_inclusive) const = 0;
   virtual RC entry_count(int64_t &count) const = 0;
+  /// 采集统计信息（条目数/NDV/最小最大键），供优化器估算选择率
+  virtual RC collect_stats(IndexStats &stats) const = 0;
+
+  /// 把定长索引键还原成值，代价估算里对范围条件做插值时用
+  RC decode_key(const std::string &key, Value &value) const;
 
 protected:
   /// 从记录数据里取出定长的索引键
@@ -57,6 +62,7 @@ public:
                   const Value *low, bool low_inclusive,
                   const Value *high, bool high_inclusive) const override;
   RC entry_count(int64_t &count) const override;
+  RC collect_stats(IndexStats &stats) const override;
 
   BplusTree       &tree() { return tree_; }
   const BplusTree &tree() const { return tree_; }

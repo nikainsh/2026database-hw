@@ -46,6 +46,9 @@ public:
 
   RC start_scan(RecordScanner &scanner);
   RC record_count(int64_t &count);
+  /// 惰性采集索引统计信息（条目数/NDV/最小最大键）并缓存在 TableMeta 里；
+  /// 已采集过的只从索引头 O(1) 刷新条目数。供优化器代价估算使用。
+  RC ensure_index_stats();
 
   const std::string &dir() const { return dir_; }
 

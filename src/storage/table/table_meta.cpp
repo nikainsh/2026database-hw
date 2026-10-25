@@ -28,6 +28,35 @@ RC IndexMeta::deserialize(BinaryReader &r, IndexMeta &meta)
   return r.ok() ? RC::SUCCESS : RC::IOERR_READ;
 }
 
+void IndexStats::serialize(BinaryWriter &w) const
+{
+  w.put_bool(valid);
+  if (!valid) {
+    return;
+  }
+  w.put_i64(entries);
+  w.put_i64(distinct_keys);
+  w.put_string(min_key);
+  w.put_string(max_key);
+}
+
+RC IndexStats::deserialize(BinaryReader &r, IndexStats &stats)
+{
+  stats = IndexStats();
+  stats.valid = r.get_bool();
+  if (!r.ok()) {
+    return RC::IOERR_READ;
+  }
+  if (!stats.valid) {
+    return RC::SUCCESS;
+  }
+  stats.entries       = r.get_i64();
+  stats.distinct_keys = r.get_i64();
+  stats.min_key       = r.get_string();
+  stats.max_key       = r.get_string();
+  return r.ok() ? RC::SUCCESS : RC::IOERR_READ;
+}
+
 // ---------------------------------------------------------------------------
 // ColumnMeta
 // ---------------------------------------------------------------------------
@@ -160,18 +189,55 @@ RC TableMeta::add_index(const IndexMeta &meta)
   if (index(meta.index_name) != nullptr) {
     return RC::SCHEMA_INDEX_NAME_REPEAT;
   }
-  if (column(meta.field_name) == nullptr) {
+  const ColumnMeta *target = column(meta.field_name);
+  if (target == nullptr) {
     return RC::SCHEMA_FIELD_NOT_EXIST;
   }
   indexes_.push_back(meta);
+  index_stats_.emplace_back();  /// 统计信息稍后由 Table 惰性采集
   return RC::SUCCESS;
+}
+
+RC TableMeta::set_index_stats(const std::string &index_name, const IndexStats &stats)
+{
+  const IndexMeta *meta = index(index_name);
+  if (meta == nullptr) {
+    return RC::SCHEMA_INDEX_NOT_EXIST;
+  }
+  for (size_t i = 0; i < indexes_.size(); ++i) {
+    if (indexes_[i].index_name == index_name) {
+      if (index_stats_.size() != indexes_.size()) {
+        index_stats_.resize(indexes_.size());
+      }
+      index_stats_[i] = stats;
+      return RC::SUCCESS;
+    }
+  }
+  return RC::SCHEMA_INDEX_NOT_EXIST;
+}
+
+const IndexStats *TableMeta::index_stats(const std::string &index_name) const
+{
+  for (size_t i = 0; i < indexes_.size(); ++i) {
+    if (indexes_[i].index_name == index_name) {
+      if (i >= index_stats_.size()) {
+        return nullptr;
+      }
+      return &index_stats_[i];
+    }
+  }
+  return nullptr;
 }
 
 RC TableMeta::remove_index(const std::string &index_name)
 {
   for (auto it = indexes_.begin(); it != indexes_.end(); ++it) {
+    const size_t position = static_cast<size_t>(it - indexes_.begin());
     if (it->index_name == index_name) {
       indexes_.erase(it);
+      if (position < index_stats_.size()) {
+        index_stats_.erase(index_stats_.begin() + static_cast<long>(position));
+      }
       return RC::SUCCESS;
     }
   }
@@ -228,12 +294,18 @@ void TableMeta::serialize(BinaryWriter &w) const
     column.serialize(w);
   }
   w.put_i32(static_cast<int32_t>(indexes_.size()));
-  for (const IndexMeta &meta : indexes_) {
-    meta.serialize(w);
+  for (size_t i = 0; i < indexes_.size(); ++i) {
+    indexes_[i].serialize(w);
+    const size_t position = i < index_stats_.size() ? i : static_cast<size_t>(-1);
+    if (position < index_stats_.size()) {
+      index_stats_[position].serialize(w);
+    } else {
+      IndexStats().serialize(w);  /// 占位：valid=false
+    }
   }
 }
 
-RC TableMeta::deserialize(BinaryReader &r, TableMeta &meta)
+RC TableMeta::deserialize(BinaryReader &r, TableMeta &meta, bool with_stats)
 {
   const std::string name = r.get_string();
   const int32_t     count = r.get_i32();
@@ -260,6 +332,7 @@ RC TableMeta::deserialize(BinaryReader &r, TableMeta &meta)
   if (!r.ok() || index_count < 0 || index_count > 1024) {
     return RC::IOERR_READ;
   }
+  std::vector<IndexStats> stats_list;
   for (int32_t i = 0; i < index_count; ++i) {
     IndexMeta index_meta;
     rc        = IndexMeta::deserialize(r, index_meta);
@@ -270,6 +343,18 @@ RC TableMeta::deserialize(BinaryReader &r, TableMeta &meta)
     if (OB_FAIL(rc)) {
       return rc;
     }
+
+    if (with_stats) {
+      IndexStats stats;
+      rc       = IndexStats::deserialize(r, stats);
+      if (OB_FAIL(rc)) {
+        return rc;
+      }
+      stats_list.push_back(stats);
+    }
+  }
+  for (int32_t i = 0; i < static_cast<int32_t>(stats_list.size()); ++i) {
+    meta.set_index_stats(meta.indexes()[i].index_name, stats_list[i]);
   }
   return r.ok() ? RC::SUCCESS : RC::IOERR_READ;
 }
