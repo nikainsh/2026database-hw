@@ -1,6 +1,7 @@
 /* database26 buffer manager - global frame pool and replacement */
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -34,7 +35,7 @@ public:
   FrameManager(const FrameManager &)            = delete;
   FrameManager &operator=(const FrameManager &) = delete;
 
-  RC acquire(DiskBufferPool *owner, PageNum page, FrameId *frame_id);
+  RC acquire(DiskBufferPool *owner, PageNum page, FrameId *frame_id, bool background = false);
   /// Queue a non-blocking prefetch. Duplicate/queued/cached pages are ignored.
   void prefetch(DiskBufferPool *owner, PageNum page);
   /// Stop accepting prefetches for `owner` and wait for in-flight prefetches.
@@ -47,7 +48,7 @@ public:
   RC remove_owner(DiskBufferPool *owner);
   bool has_dirty(DiskBufferPool *owner) const;
 
-  RC   unpin(FrameId frame_id);
+  RC   unpin(FrameId frame_id, bool background = false);
   RC   mark_dirty(FrameId frame_id);
   char *data(FrameId frame_id);
 
@@ -89,6 +90,7 @@ private:
   std::unordered_set<uint64_t>       prefetch_pending_;
   std::unordered_map<DiskBufferPool *, int> owner_active_ops_;
   std::unordered_set<DiskBufferPool *>      closing_owners_;
+  std::atomic<int>                    background_pins_{0};
   std::thread                        worker_;
   bool                               stop_ = false;
 };

@@ -164,3 +164,26 @@ mixed_80_20:   ops=5000  time=459.1 ms throughput=10892 ops/s
 ```
 
 混合写吞吐明显低于读，主要因为当前 WAL 每次写页都 fsync。后续如果要优化写路径，可以做 group commit / 批量 fsync。
+
+---
+
+## 9. 后台临时 pin 与误报 NOBUF 的修复
+
+后台刷脏/预取会临时 pin 帧，可能让小 frame 池在极短时间内看起来“没有可淘汰帧”。  
+v3 对这类临时占用做了区分：
+
+- `Frame` 增加独立的 `background_pin_count`；
+- 前台 `acquire` 找不到 victim 时：
+  - 如果仍有后台临时 pin，等待条件变量；
+  - 如果只剩用户 pin，立即返回 `BUFFERPOOL_NOBUF`；
+- 后台刷脏使用 `try_lock` 获取页锁，拿不到就跳过该页并立即 unpin，避免用户等后台；
+- `dispose_page` 遇到“只有后台临时 pin”的页面会等待，遇到真实用户 pin 仍立即返回 `BUFFERPOOL_PAGE_PINNED`；
+- 后台预取属于 best-effort，`acquire(..., background=true)` 在无可用帧时直接放弃，不会阻塞 stop/close。
+
+新增回归测试：
+
+```text
+tests/test_background_flush_pressure.cpp
+```
+
+它用 2 帧的小池持续读写/dispose，同时让后台刷脏运行，要求不出现误报的 `BUFFERPOOL_NOBUF` 或 `BUFFERPOOL_PAGE_PINNED`。

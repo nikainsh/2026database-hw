@@ -40,6 +40,13 @@ public:
   void decrease_pin_count() { pin_count_.fetch_sub(1, std::memory_order_relaxed); }
   void set_pin_count(int value) { pin_count_.store(value, std::memory_order_relaxed); }
 
+  /// Pins held by prefetch/background flush. These are temporary and user
+  /// acquisitions may wait for them instead of reporting BUFFERPOOL_NOBUF.
+  int  background_pin_count() const { return background_pin_count_.load(std::memory_order_relaxed); }
+  void increase_background_pin_count() { background_pin_count_.fetch_add(1, std::memory_order_relaxed); }
+  void decrease_background_pin_count() { background_pin_count_.fetch_sub(1, std::memory_order_relaxed); }
+  void clear_background_pin_count() { background_pin_count_.store(0, std::memory_order_relaxed); }
+
   bool is_dirty() const { return dirty_.load(std::memory_order_relaxed); }
   void mark_dirty() { dirty_.store(true, std::memory_order_relaxed); }
   void clear_dirty() { dirty_.store(false, std::memory_order_relaxed); }
@@ -65,7 +72,8 @@ public:
 private:
   FrameId         frame_id_     = INVALID_FRAME_ID;
   PageNum         page_id_      = INVALID_PAGE_NUM;
-  std::atomic<int> pin_count_{0};
+  std::atomic<int>  pin_count_{0};
+  std::atomic<int>  background_pin_count_{0};
   std::atomic<bool> dirty_{false};
   bool             loading_     = false;
   DiskBufferPool *owner_        = nullptr;

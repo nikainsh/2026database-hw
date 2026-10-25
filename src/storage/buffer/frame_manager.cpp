@@ -46,9 +46,9 @@ void FrameManager::worker_loop()
 
     if (has_request) {
       FrameId frame_id = INVALID_FRAME_ID;
-      RC      rc       = acquire(request.owner, request.page, &frame_id);
+      RC      rc       = acquire(request.owner, request.page, &frame_id, true);
       if (OB_SUCC(rc)) {
-        unpin(frame_id);
+        unpin(frame_id, true);
       }
 
       std::lock_guard<std::mutex> lock(mutex_);
@@ -80,6 +80,8 @@ void FrameManager::flush_some()
         continue;
       }
       frame.increase_pin_count();
+      frame.increase_background_pin_count();
+      background_pins_.fetch_add(1, std::memory_order_relaxed);
       ++owner_active_ops_[frame.owner()];
       batch.push_back(frame.frame_id());
     }
@@ -91,10 +93,15 @@ void FrameManager::flush_some()
       continue;
     }
     DiskBufferPool *owner = frame->owner();
-    lock_exclusive(frame_id);
-    flush_frame_locked(*frame);
-    unlock_exclusive(frame_id);
-    unpin(frame_id);
+
+    /// Background flush must not block on a page latch held by a user. If the
+    /// latch is busy, skip this page and release the temporary pin immediately.
+    std::unique_lock<std::shared_mutex> frame_lock(frame->latch(), std::try_to_lock);
+    if (frame_lock.owns_lock()) {
+      flush_frame_locked(*frame);
+      frame_lock.unlock();
+    }
+    unpin(frame_id, true);
 
     std::lock_guard<std::mutex> guard(mutex_);
     auto iter = owner_active_ops_.find(owner);
@@ -206,7 +213,7 @@ RC FrameManager::flush_frame_locked(Frame &frame)
   return rc;
 }
 
-RC FrameManager::acquire(DiskBufferPool *owner, PageNum page, FrameId *frame_id)
+RC FrameManager::acquire(DiskBufferPool *owner, PageNum page, FrameId *frame_id, bool background)
 {
   if (owner == nullptr || frame_id == nullptr) {
     return RC::INVALID_ARGUMENT;
@@ -215,97 +222,112 @@ RC FrameManager::acquire(DiskBufferPool *owner, PageNum page, FrameId *frame_id)
   std::unique_lock<std::mutex> lock(mutex_);
   const uint64_t key = page_key(owner, page);
 
-  /// A concurrent miss inserts a loading frame before doing I/O. Wait for the
-  /// loader to finish instead of issuing a duplicate read.
   while (true) {
     auto iter = page_table_.find(key);
-    if (iter == page_table_.end()) {
-      break;
+    if (iter != page_table_.end()) {
+      Frame *frame = frame_at(iter->second);
+      if (frame == nullptr) {
+        return RC::BUFFERPOOL_CORRUPTED;
+      }
+      if (frame->isLoading()) {
+        cv_.wait(lock);
+        continue;
+      }
+      frame->increase_pin_count();
+      if (background) {
+        frame->increase_background_pin_count();
+        background_pins_.fetch_add(1, std::memory_order_relaxed);
+      }
+      replacement_.on_access(*frame);
+      owner->stats_.hits.fetch_add(1, std::memory_order_relaxed);
+      *frame_id = frame->frame_id();
+      return RC::SUCCESS;
     }
-    Frame *frame = frame_at(iter->second);
+
+    const FrameId victim_id = choose_victim_locked(owner);
+    if (victim_id == INVALID_FRAME_ID) {
+      /// Background pins are temporary. A foreground caller waits for them
+      /// instead of reporting a spurious BUFFERPOOL_NOBUF. A background
+      /// request never waits (prefetch is best-effort), so it cannot block
+      /// stop()/close().
+      if (!background && background_pins_.load(std::memory_order_relaxed) > 0) {
+        cv_.wait(lock);
+        continue;
+      }
+      owner->stats_.no_buffer.fetch_add(1, std::memory_order_relaxed);
+      return RC::BUFFERPOOL_NOBUF;
+    }
+
+    Frame *frame = frame_at(victim_id);
     if (frame == nullptr) {
       return RC::BUFFERPOOL_CORRUPTED;
     }
-    if (frame->isLoading()) {
-      cv_.wait(lock);
-      continue;
+
+    if (frame->page_id() != INVALID_PAGE_NUM) {
+      if (frame->is_dirty()) {
+        RC rc = flush_frame_locked(*frame);
+        if (OB_FAIL(rc)) {
+          return rc;
+        }
+        frame->owner()->stats_.dirty_evictions.fetch_add(1, std::memory_order_relaxed);
+      }
+      page_table_.erase(page_key(frame->owner(), frame->page_id()));
+      auto count_iter = owner_frame_counts_.find(frame->owner());
+      if (count_iter != owner_frame_counts_.end()) {
+        if (--count_iter->second == 0) {
+          owner_frame_counts_.erase(count_iter);
+        }
+      }
+      frame->owner()->stats_.evictions.fetch_add(1, std::memory_order_relaxed);
+      frame->reset();
+      frame->set_owner(nullptr);
+      --used_frames_;
     }
-    frame->increase_pin_count();
+
+    frame->set_owner(owner);
+    frame->set_page_id(page);
+    frame->set_pin_count(1);
+    frame->clear_dirty();
+    frame->set_loading(true);
+    if (background) {
+      frame->increase_background_pin_count();
+      background_pins_.fetch_add(1, std::memory_order_relaxed);
+    }
     replacement_.on_access(*frame);
-    owner->stats_.hits.fetch_add(1, std::memory_order_relaxed);
-    *frame_id = frame->frame_id();
+    ++owner_frame_counts_[owner];
+    ++used_frames_;
+    page_table_[key] = victim_id;
+
+    lock.unlock();
+    RC rc = owner->read_page_for_cache(page, frame->data());
+    lock.lock();
+
+    frame->set_loading(false);
+    if (OB_FAIL(rc)) {
+      if (background) {
+        frame->decrease_background_pin_count();
+        background_pins_.fetch_sub(1, std::memory_order_relaxed);
+      }
+      page_table_.erase(key);
+      auto count_iter = owner_frame_counts_.find(owner);
+      if (count_iter != owner_frame_counts_.end()) {
+        if (--count_iter->second == 0) {
+          owner_frame_counts_.erase(count_iter);
+        }
+      }
+      --used_frames_;
+      frame->reset();
+      frame->set_owner(nullptr);
+      cv_.notify_all();
+      return rc;
+    }
+
+    owner->stats_.misses.fetch_add(1, std::memory_order_relaxed);
+    owner->stats_.reads.fetch_add(1, std::memory_order_relaxed);
+    *frame_id = victim_id;
+    cv_.notify_all();
     return RC::SUCCESS;
   }
-
-  const FrameId victim_id = choose_victim_locked(owner);
-  if (victim_id == INVALID_FRAME_ID) {
-    owner->stats_.no_buffer.fetch_add(1, std::memory_order_relaxed);
-    return RC::BUFFERPOOL_NOBUF;
-  }
-
-  Frame *frame = frame_at(victim_id);
-  if (frame == nullptr) {
-    return RC::BUFFERPOOL_CORRUPTED;
-  }
-
-  if (frame->page_id() != INVALID_PAGE_NUM) {
-    if (frame->is_dirty()) {
-      RC rc = flush_frame_locked(*frame);
-      if (OB_FAIL(rc)) {
-        return rc;
-      }
-      frame->owner()->stats_.dirty_evictions.fetch_add(1, std::memory_order_relaxed);
-    }
-    page_table_.erase(page_key(frame->owner(), frame->page_id()));
-    auto count_iter = owner_frame_counts_.find(frame->owner());
-    if (count_iter != owner_frame_counts_.end()) {
-      if (--count_iter->second == 0) {
-        owner_frame_counts_.erase(count_iter);
-      }
-    }
-    frame->owner()->stats_.evictions.fetch_add(1, std::memory_order_relaxed);
-    frame->reset();
-    frame->set_owner(nullptr);
-    --used_frames_;
-  }
-
-  frame->set_owner(owner);
-  frame->set_page_id(page);
-  frame->set_pin_count(1);
-  frame->clear_dirty();
-  frame->set_loading(true);
-  replacement_.on_access(*frame);
-  ++owner_frame_counts_[owner];
-  ++used_frames_;
-  page_table_[key] = victim_id;
-
-  /// Do the disk read without holding the global frame-manager lock. Different
-  /// pages/files can now fault in parallel.
-  lock.unlock();
-  RC rc = owner->read_page_for_cache(page, frame->data());
-  lock.lock();
-
-  frame->set_loading(false);
-  if (OB_FAIL(rc)) {
-    page_table_.erase(key);
-    auto count_iter = owner_frame_counts_.find(owner);
-    if (count_iter != owner_frame_counts_.end()) {
-      if (--count_iter->second == 0) {
-        owner_frame_counts_.erase(count_iter);
-      }
-    }
-    --used_frames_;
-    frame->reset();
-    frame->set_owner(nullptr);
-    cv_.notify_all();
-    return rc;
-  }
-
-  owner->stats_.misses.fetch_add(1, std::memory_order_relaxed);
-  owner->stats_.reads.fetch_add(1, std::memory_order_relaxed);
-  *frame_id = victim_id;
-  cv_.notify_all();
-  return RC::SUCCESS;
 }
 RC FrameManager::remove_page(DiskBufferPool *owner, PageNum page)
 {
@@ -313,34 +335,42 @@ RC FrameManager::remove_page(DiskBufferPool *owner, PageNum page)
     return RC::INVALID_ARGUMENT;
   }
 
-  std::lock_guard<std::mutex> guard(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
   const uint64_t key = page_key(owner, page);
-  auto           iter = page_table_.find(key);
-  if (iter == page_table_.end()) {
+  while (true) {
+    auto iter = page_table_.find(key);
+    if (iter == page_table_.end()) {
+      return RC::SUCCESS;
+    }
+
+    Frame *frame = frame_at(iter->second);
+    if (frame == nullptr) {
+      return RC::BUFFERPOOL_CORRUPTED;
+    }
+    if (frame->pin_count() > 0) {
+      /// If the only pins are temporary background pins (prefetch / page
+      /// cleaner), wait for them to drain. A real user pin still returns
+      /// BUFFERPOOL_PAGE_PINNED immediately.
+      if (frame->background_pin_count() > 0 && frame->pin_count() == frame->background_pin_count()) {
+        cv_.wait(lock);
+        continue;
+      }
+      return RC::BUFFERPOOL_PAGE_PINNED;
+    }
+
+    page_table_.erase(iter);
+    auto count_iter = owner_frame_counts_.find(owner);
+    if (count_iter != owner_frame_counts_.end()) {
+      if (--count_iter->second == 0) {
+        owner_frame_counts_.erase(count_iter);
+      }
+    }
+    frame->reset();
+    frame->set_owner(nullptr);
+    --used_frames_;
     return RC::SUCCESS;
   }
-
-  Frame *frame = frame_at(iter->second);
-  if (frame == nullptr) {
-    return RC::BUFFERPOOL_CORRUPTED;
-  }
-  if (frame->pin_count() > 0) {
-    return RC::BUFFERPOOL_PAGE_PINNED;
-  }
-
-  page_table_.erase(iter);
-  auto count_iter = owner_frame_counts_.find(owner);
-  if (count_iter != owner_frame_counts_.end()) {
-    if (--count_iter->second == 0) {
-      owner_frame_counts_.erase(count_iter);
-    }
-  }
-  frame->reset();
-  frame->set_owner(nullptr);
-  --used_frames_;
-  return RC::SUCCESS;
 }
-
 RC FrameManager::flush_page(DiskBufferPool *owner, PageNum page)
 {
   if (owner == nullptr) {
@@ -450,7 +480,7 @@ RC FrameManager::remove_owner(DiskBufferPool *owner)
   return rc;
 }
 
-RC FrameManager::unpin(FrameId frame_id)
+RC FrameManager::unpin(FrameId frame_id, bool background)
 {
   Frame *frame = frame_at(frame_id);
   if (frame == nullptr) {
@@ -461,7 +491,14 @@ RC FrameManager::unpin(FrameId frame_id)
     ASSERT(false, "unpin a page which is not pinned. frame=%d", frame_id);
     return RC::INVALID_ARGUMENT;
   }
+  if (background) {
+    frame->decrease_background_pin_count();
+    background_pins_.fetch_sub(1, std::memory_order_relaxed);
+  }
   frame->decrease_pin_count();
+  if (background) {
+    cv_.notify_all();
+  }
   return RC::SUCCESS;
 }
 
