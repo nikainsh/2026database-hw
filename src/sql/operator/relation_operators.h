@@ -47,6 +47,11 @@ class NestedLoopJoinOperator : public PhysicalOperator
 {
 public:
   explicit NestedLoopJoinOperator(std::vector<Expression *> on_conditions) : on_conditions_(std::move(on_conditions)) {}
+  /// 只有一个连接条件（或没有条件，传 nullptr）时的便捷写法
+  explicit NestedLoopJoinOperator(Expression *on_condition)
+      : on_conditions_(on_condition == nullptr ? std::vector<Expression *>()
+                                              : std::vector<Expression *>{on_condition})
+  {}
 
   PhysicalOperatorKind kind() const override { return PhysicalOperatorKind::NESTED_LOOP_JOIN; }
   RC                   open() override;

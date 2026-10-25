@@ -25,9 +25,20 @@ enum class PhysicalOperatorKind
   UPDATE,
   STRING_LIST,
   EXPLAIN,
+  HASH_JOIN,
 };
 
 const char *physical_operator_kind_to_string(PhysicalOperatorKind kind);
+
+/// 单次计划执行累计统计；同一算子在连接中被重新打开时继续累加。
+struct OperatorStatistics
+{
+  int64_t open_calls = 0, next_calls = 0, close_calls = 0;
+  int64_t output_rows = 0, errors = 0, candidate_pairs = 0;
+  int64_t open_ns = 0, next_ns = 0, close_ns = 0;
+  int64_t build_rows = 0, probe_rows = 0;
+  size_t peak_build_bytes = 0; // Estimate, not process RSS or allocator accounting.
+};
 
 /**
  * @brief 物理算子基类：火山模型（open / next / close）
@@ -54,12 +65,20 @@ public:
     (void)outer;
     return RC::SUCCESS;
   }
+  // 执行驱动和父算子使用这些入口；关闭统计时直接转发，不读取时钟。
+  RC open_tracked();
+  RC next_tracked(Tuple *&tuple);
+  RC close_tracked();
+  void reset_statistics(bool enabled);
+  const OperatorStatistics &statistics() const { return statistics_; }
+  int64_t input_rows() const;
+  void explain_statistics(std::ostream &os, int depth = 0) const;
   /// 默认实现递归关闭所有子算子；需要额外清理的算子再自己覆盖
   virtual RC close()
   {
     RC rc = RC::SUCCESS;
     for (auto &child : children_) {
-      RC one = child->close();
+      RC one = child->close_tracked();
       if (OB_FAIL(one)) {
         rc = one;
       }
@@ -78,6 +97,19 @@ public:
   void    increase_affected_rows(int64_t count = 1) { affected_rows_ += count; }
 
 protected:
+  void count_candidate_pair() { if (statistics_enabled_) ++statistics_.candidate_pairs; }
+  void count_build_row(size_t bytes)
+  {
+    if (statistics_enabled_) {
+      ++statistics_.build_rows;
+      if (bytes > statistics_.peak_build_bytes) statistics_.peak_build_bytes = bytes;
+    }
+  }
+  void count_probe_row() { if (statistics_enabled_) ++statistics_.probe_rows; }
   std::vector<std::unique_ptr<PhysicalOperator>> children_;
   int64_t                                        affected_rows_ = 0;
+
+private:
+  bool statistics_enabled_ = false;
+  OperatorStatistics statistics_;
 };
