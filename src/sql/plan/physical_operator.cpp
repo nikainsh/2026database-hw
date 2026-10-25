@@ -69,6 +69,10 @@ void PhysicalOperator::explain_statistics(std::ostream &os, int depth) const
      << " in_rows=" << input_rows() << " out_rows=" << s.output_rows
      << " opens=" << s.open_calls << " nexts=" << s.next_calls << " closes=" << s.close_calls
      << " errors=" << s.errors << " candidates=" << s.candidate_pairs;
+  if (kind() == PhysicalOperatorKind::HASH_JOIN) {
+    os << " build_rows=" << s.build_rows << " probe_rows=" << s.probe_rows
+       << " peak_build_bytes_est=" << s.peak_build_bytes;
+  }
   // 独立流格式化，避免改变调用者的精度设置。
   std::ostringstream time;
   time << std::fixed << std::setprecision(3)
@@ -94,6 +98,7 @@ const char *physical_operator_kind_to_string(PhysicalOperatorKind kind)
     case PhysicalOperatorKind::UPDATE: return "update";
     case PhysicalOperatorKind::STRING_LIST: return "string_list";
     case PhysicalOperatorKind::EXPLAIN: return "explain";
+    case PhysicalOperatorKind::HASH_JOIN: return "hash_join";
   }
   return "unknown";
 }

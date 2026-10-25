@@ -25,6 +25,7 @@ enum class PhysicalOperatorKind
   UPDATE,
   STRING_LIST,
   EXPLAIN,
+  HASH_JOIN,
 };
 
 const char *physical_operator_kind_to_string(PhysicalOperatorKind kind);
@@ -35,6 +36,8 @@ struct OperatorStatistics
   int64_t open_calls = 0, next_calls = 0, close_calls = 0;
   int64_t output_rows = 0, errors = 0, candidate_pairs = 0;
   int64_t open_ns = 0, next_ns = 0, close_ns = 0;
+  int64_t build_rows = 0, probe_rows = 0;
+  size_t peak_build_bytes = 0; // Estimate, not process RSS or allocator accounting.
 };
 
 /**
@@ -85,6 +88,14 @@ public:
 
 protected:
   void count_candidate_pair() { if (statistics_enabled_) ++statistics_.candidate_pairs; }
+  void count_build_row(size_t bytes)
+  {
+    if (statistics_enabled_) {
+      ++statistics_.build_rows;
+      if (bytes > statistics_.peak_build_bytes) statistics_.peak_build_bytes = bytes;
+    }
+  }
+  void count_probe_row() { if (statistics_enabled_) ++statistics_.probe_rows; }
   std::vector<std::unique_ptr<PhysicalOperator>> children_;
   int64_t                                        affected_rows_ = 0;
 
