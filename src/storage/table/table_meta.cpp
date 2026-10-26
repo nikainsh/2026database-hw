@@ -291,12 +291,21 @@ RC TableMeta::make_record(const std::vector<Value> &values, Record &record) cons
 RC TableMeta::get_field_value(const Record &record, const ColumnMeta &column, Value &value) const
 {
   value = Value();
+  /// 记录缓冲区可能来自别的表、或比本表更短：先确认这一列确实落在记录范围内再解包
+  if (record.data() == nullptr || column.offset() < 0 || record.len() < column.offset() + column.data_len()) {
+    LOG_WARN("record buffer too short for column. table=%s, column=%s, record_len=%d, need=%d",
+             table_name_.c_str(), column.name().c_str(), record.len(), column.offset() + column.data_len());
+    return RC::INVALID_ARGUMENT;
+  }
   value.set_type(column.type());
   return value.unpack_from(record.data() + column.offset(), column.data_len());
 }
 
 const char *TableMeta::field_data(const Record &record, const ColumnMeta &column) const
 {
+  if (record.data() == nullptr || column.offset() < 0 || record.len() < column.offset() + column.data_len()) {
+    return nullptr;
+  }
   return record.data() + column.offset();
 }
 

@@ -1445,8 +1445,8 @@ RC BplusTree::validate_node_locked(PageNum page_num, bool is_root, std::vector<s
               std::to_string(page_num).c_str(), std::to_string(count).c_str(), header_.order);
     return RC::INTERNAL;
   }
-  /// 除根之外，任何节点的键数都不能低于下限
-  if (!is_root && count < (is_leaf_page(node) ? header_.min_keys : header_.min_keys)) {
+  /// 除根之外，任何节点的键数都不能低于下限（叶子和内部节点的下限都是 order/2）
+  if (!is_root && count < header_.min_keys) {
     LOG_ERROR("node underflow. file=%s, page=%s, count=%s, min=%d", file_name_.c_str(),
               std::to_string(page_num).c_str(), std::to_string(count).c_str(), header_.min_keys);
     return RC::INTERNAL;
@@ -1467,10 +1467,29 @@ RC BplusTree::validate_node_locked(PageNum page_num, bool is_root, std::vector<s
   }
 
   for (int32_t i = 0; i <= count; ++i) {
-    rc = validate_node_locked(child_at(node, i), false, keys);
+    const PageNum child = child_at(node, i);
+
+    /// 每个子树单独收集自己的键序列，才能检查「分隔键 == 子树最小键」这条核心不变量
+    std::vector<std::string> child_keys;
+    rc = validate_node_locked(child, false, child_keys);
     if (OB_FAIL(rc)) {
       return rc;
     }
+
+    /// key[i-1] 必须是 child[i] 子树的最小键，否则 find_leaf 会走错分支
+    if (i > 0) {
+      if (child_keys.empty()) {
+        LOG_ERROR("empty subtree under separator. file=%s, page=%s, child=%d",
+                  file_name_.c_str(), std::to_string(page_num).c_str(), i);
+        return RC::INTERNAL;
+      }
+      if (compare_keys(internal_key_at(node, i - 1), child_keys.front().c_str()) != 0) {
+        LOG_ERROR("separator key mismatch. file=%s, page=%s, child=%d",
+                  file_name_.c_str(), std::to_string(page_num).c_str(), i);
+        return RC::INTERNAL;
+      }
+    }
+    keys.insert(keys.end(), child_keys.begin(), child_keys.end());
   }
   return RC::SUCCESS;
 }
