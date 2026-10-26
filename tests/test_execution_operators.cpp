@@ -1,9 +1,11 @@
 // Combined v3/v4: real filter/project/aggregate correctness and execution counters.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -310,17 +312,47 @@ static void test_real_sql()
   const std::string query = "select l.id, r.id from profile_left l, profile_right r where l.id=r.id";
   sql(query);
   CHECK(writer.rows.size() == 3 && engine.last_profile().empty());
-  Rows normal = writer.rows;
+  auto join_rows = [](const Rows &rows) {
+    std::vector<std::pair<int32_t, int32_t>> values;
+    for (const auto &row : rows) {
+      CHECK(row.size() == 2 && row[0].type() == AttrType::INT && row[1].type() == AttrType::INT);
+      values.emplace_back(row[0].get_int32(), row[1].get_int32());
+    }
+    std::sort(values.begin(), values.end());
+    return values;
+  };
+  const std::vector<std::pair<int32_t, int32_t>> expected{{1, 1}, {1, 1}, {2, 2}};
+  CHECK(join_rows(writer.rows) == expected); // Preserve duplicate multiplicity, ignore unspecified order.
   engine.set_profile_enabled(true);
-  sql(query);
-  CHECK(writer.rows.size() == normal.size());
-  for (size_t i = 0; i < normal.size(); ++i) {
-    CHECK(writer.rows[i][0].get_int32() == normal[i][0].get_int32());
-    CHECK(writer.rows[i][1].get_int32() == normal[i][1].get_int32());
+  for (const std::string &text : {query, std::string(
+      "select l.id, r.id from profile_right r, profile_left l where r.id=l.id")}) {
+    sql(text);
+    CHECK(join_rows(writer.rows) == expected);
+    const std::string &profile = engine.last_profile();
+    CHECK(profile.find("profile_left") != std::string::npos);
+    CHECK(profile.find("profile_right") != std::string::npos);
+    // SQL plans may reorder inputs or select a different join algorithm. Exact NLJ
+    // candidates/right reopen counts remain covered in test_join_statistics().
+    std::istringstream lines(profile);
+    std::string line;
+    int operators = 0;
+    while (std::getline(lines, line)) {
+      if (line.find(" in_rows=") == std::string::npos) continue;
+      auto metric = [&](const std::string &name) -> int64_t {
+        const std::string prefix = " " + name + "=";
+        const size_t pos = line.find(prefix);
+        CHECK(pos != std::string::npos);
+        return std::stoll(line.substr(pos + prefix.size()));
+      };
+      CHECK(metric("errors") == 0);
+      CHECK(metric("opens") == metric("closes"));
+      CHECK(metric("nexts") >= metric("out_rows"));
+      if (operators++ == 0) {
+        CHECK(metric("out_rows") == 3 && metric("opens") == 1 && metric("nexts") == 4);
+      }
+    }
+    CHECK(operators >= 3); // Root and both input scans must actually be profiled.
   }
-  CHECK(engine.last_profile().find("candidates=6") != std::string::npos);
-  CHECK(engine.last_profile().find("table_scan(profile_right) in_rows=0 out_rows=6 opens=3") != std::string::npos);
-  CHECK(engine.last_profile().find("errors=0") != std::string::npos);
   sql("select count(*), sum(id) from profile_left");
   CHECK(writer.rows.size() == 1 && writer.rows[0][0].get_int64() == 3 && writer.rows[0][1].get_int64() == 4);
   CHECK(engine.last_profile().find("in_rows=3 out_rows=1") != std::string::npos);
