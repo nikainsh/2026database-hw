@@ -54,6 +54,36 @@ inline void init_slotted_page(char *page)
   header->free_end      = BP_PAGE_SIZE;
 }
 
+/**
+ * @brief 页头自检
+ * @details 缓冲池没有数据页 checksum/doublewrite（见 docs/buffer-v3.md），崩溃后可能读到
+ *          半写页；各个字段都直接参与偏移计算，任何一个被读坏都可能造成越界写。所以在
+ *          使用页之前统一校验一遍：记录区 [sizeof(header), free_start)、空闲区
+ *          [free_start, free_end)、槽位目录 [free_end, BP_PAGE_SIZE) 互不重叠且都在页内。
+ */
+inline bool check_slotted_page(const char *page)
+{
+  const SlottedPageHeader *header = page_header_of(page);
+
+  if (header->record_count < 0 || header->deleted_count < 0 || header->deleted_count > header->record_count) {
+    return false;
+  }
+  if (header->free_start < static_cast<int32_t>(sizeof(SlottedPageHeader)) || header->free_end > BP_PAGE_SIZE ||
+      header->free_start > header->free_end) {
+    return false;
+  }
+  if (header->free_end % static_cast<int32_t>(sizeof(int32_t)) != 0) {
+    return false;  /// 槽位目录按 4 字节对齐
+  }
+
+  /// 槽位目录占 [free_end, BP_PAGE_SIZE)，每个槽位 4 字节，不能超出这个区间
+  const int32_t directory_bytes = BP_PAGE_SIZE - header->free_end;
+  if (header->record_count > directory_bytes / static_cast<int32_t>(sizeof(int32_t))) {
+    return false;
+  }
+  return true;
+}
+
 /// 找一个已删除的槽位，没有则返回 -1
 inline SlotNum find_free_slot(const char *page)
 {

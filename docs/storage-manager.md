@@ -128,8 +128,13 @@ pool->get_page_write(page, handle);   // 排他页锁，改 value() 后必须 ma
 | --- | --- |
 | `BplusTree` | 树级 `std::shared_mutex latch_`：`open/close/insert_entry/delete_entry` 取 `unique_lock`；`get_entry/entry_exists/validate/validate_node` 取 `shared_lock` |
 | `BplusTreeScanner` | 生命周期内持树级 `shared_lock`（`tree_lock_`），把结构变更挡在外面；`close()` 释放。**用完必须 `close()` 或 `restart()`/析构**，否则插入会被阻塞 |
-| `HeapRecordManager` | 没有表级锁，靠页锁把同一页的读写串行化；跨页操作（插入找页）是「试写一页 → 不行下一张」，并发下由一个线程最终插进去 |
-| `Table` | 没有额外加锁：堆文件与索引的更新不是原子事务，唯一冲突靠显式回滚；并发写同一张表需要上层（执行引擎）串行化 |
+| `HeapRecordManager` | 表级 `std::mutex latch_`：`insert/update/delete/close/get_record_count` 串行化。表头（行数、`last_insert_page`）在内存里缓存，写操作只改缓存再落盘，因此不存在「两个线程各自读 count=N 再写回 N+1」的丢更新；`get_record`/扫描走页读锁，不加表锁 |
+| `RecordScanner` | 一页只 pin 一次（同页连续取行不再取页），代价是**扫描期间持有当前页读锁**：同一线程里扫描未结束时不要写同一张表，会自死锁 |
+| `Table` | 索引与堆文件的更新不是原子事务：多索引写入失败靠 `IndexChangeLog` 逆序回滚；并发写同一张表的原子性仍需上层（执行引擎）保证 |
+
+页级损坏防护：数据页没有 checksum/doublewrite（见 `docs/buffer-v3.md`），所以 `HeapRecordManager` 与
+`RecordScanner` 在使用一页之前都会用 `check_slotted_page()` 校验页头（`record_count/deleted_count/free_start/free_end`
+互相不越界），读坏页返回 `RC::BUFFERPOOL_CORRUPTED`，而不是按坏偏移去读写。
 
 缓冲池层另有 WAL（`<datafile>.wal` + checkpoint），保证**页级**崩溃恢复；表级/事务级语义不在本组件范围内。
 

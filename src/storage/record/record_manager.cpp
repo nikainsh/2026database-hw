@@ -3,8 +3,22 @@
 #include "storage/record/record_manager.h"
 
 #include <cstring>
+#include <mutex>
 
 #include "common/log.h"
+
+namespace
+{
+/// 页头自检失败统一返回「页损坏」：宁可报错，也不要按被读坏的偏移去写页
+RC check_page(const char *page, const char *file_name, PageNum page_num)
+{
+  if (check_slotted_page(page)) {
+    return RC::SUCCESS;
+  }
+  LOG_ERROR("invalid slotted page header. file=%s, page=%d", file_name, page_num);
+  return RC::BUFFERPOOL_CORRUPTED;
+}
+}  // namespace
 
 HeapRecordManager::~HeapRecordManager() { close(); }
 
@@ -19,9 +33,10 @@ RC HeapRecordManager::open(DiskBufferPool *buffer_pool, int record_size, bool cr
     return RC::INVALID_ARGUMENT;
   }
 
-  buffer_pool_ = buffer_pool;
-  file_name_   = buffer_pool->file_name();
-  record_size_ = record_size;
+  buffer_pool_  = buffer_pool;
+  file_name_    = buffer_pool->file_name();
+  record_size_  = record_size;
+  header_dirty_ = false;
 
   if (create) {
     PageNum page_num = INVALID_PAGE_NUM;
@@ -34,27 +49,27 @@ RC HeapRecordManager::open(DiskBufferPool *buffer_pool, int record_size, bool cr
       return RC::INTERNAL;
     }
 
-    RecordFileHeader header;
-    header.record_size     = record_size_;
-    header.record_count    = 0;
-    header.last_insert_page = RECORD_FIRST_DATA_PAGE;
-    rc                     = write_header(header);
+    header_                  = RecordFileHeader();
+    header_.record_size      = record_size_;
+    header_.record_count     = 0;
+    header_.last_insert_page = RECORD_FIRST_DATA_PAGE;
+    header_dirty_            = true;
+    rc                       = flush_header();
     if (OB_FAIL(rc)) {
       return rc;
     }
   } else {
-    RecordFileHeader header;
-    RC               rc = read_header(header);
+    RC rc = load_header();
     if (OB_FAIL(rc)) {
       return rc;
     }
-    if (header.magic != RECORD_FILE_MAGIC) {
+    if (header_.magic != RECORD_FILE_MAGIC) {
       LOG_ERROR("invalid record file magic. file=%s", file_name_.c_str());
       return RC::IOERR_READ;
     }
-    if (header.record_size != record_size_) {
+    if (header_.record_size != record_size_) {
       LOG_ERROR("record size mismatch. file=%s, file=%d, expect=%d",
-                file_name_.c_str(), header.record_size, record_size_);
+                file_name_.c_str(), header_.record_size, record_size_);
       return RC::SCHEMA_FIELD_TYPE_MISMATCH;
     }
   }
@@ -65,12 +80,22 @@ RC HeapRecordManager::open(DiskBufferPool *buffer_pool, int record_size, bool cr
 
 RC HeapRecordManager::close()
 {
+  std::lock_guard<std::mutex> guard(latch_);
+
+  RC rc = RC::SUCCESS;
+  if (opened_ && buffer_pool_ != nullptr) {
+    rc = flush_header();
+    if (OB_FAIL(rc)) {
+      LOG_ERROR("failed to flush record header on close. file=%s, rc=%s", file_name_.c_str(), strrc(rc));
+    }
+  }
+
   opened_      = false;
   buffer_pool_ = nullptr;  /// 文件由 DiskBufferPoolManager 统一关闭
-  return RC::SUCCESS;
+  return rc;
 }
 
-RC HeapRecordManager::read_header(RecordFileHeader &header)
+RC HeapRecordManager::load_header()
 {
   if (buffer_pool_ == nullptr) {
     return RC::RECORD_OPENNED;
@@ -81,23 +106,54 @@ RC HeapRecordManager::read_header(RecordFileHeader &header)
   if (OB_FAIL(rc)) {
     return rc;
   }
-  memcpy(&header, handle.const_data(), sizeof(header));
+  memcpy(&header_, handle.const_data(), sizeof(header_));
+  header_dirty_ = false;
   return RC::SUCCESS;
 }
 
-RC HeapRecordManager::write_header(const RecordFileHeader &header)
+RC HeapRecordManager::flush_header()
 {
+  if (buffer_pool_ == nullptr) {
+    return RC::RECORD_OPENNED;
+  }
+  if (!header_dirty_) {
+    return RC::SUCCESS;
+  }
+
   PageHandle handle;
   RC         rc = buffer_pool_->get_page_write(RECORD_META_PAGE, handle);
   if (OB_FAIL(rc)) {
     return rc;
   }
-  memcpy(handle.value(), &header, sizeof(header));
-  return handle.mark_dirty();
+  memcpy(handle.value(), &header_, sizeof(header_));
+  rc = handle.mark_dirty();
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+  header_dirty_ = false;
+  return RC::SUCCESS;
+}
+
+RC HeapRecordManager::read_header(RecordFileHeader &header)
+{
+  if (buffer_pool_ == nullptr) {
+    return RC::RECORD_OPENNED;
+  }
+  header = header_;
+  return RC::SUCCESS;
+}
+
+RC HeapRecordManager::write_header(const RecordFileHeader &header)
+{
+  header_       = header;
+  header_dirty_ = true;
+  return flush_header();
 }
 
 RC HeapRecordManager::insert_record(Record &record)
 {
+  std::lock_guard<std::mutex> guard(latch_);
+
   if (!opened_) {
     return RC::RECORD_OPENNED;
   }
@@ -123,7 +179,7 @@ RC HeapRecordManager::insert_record(Record &record)
     page_num = RECORD_FIRST_DATA_PAGE;
   }
 
-  const PageNum start  = page_num;
+  const PageNum start   = page_num;
   bool          wrapped = false;
   while (true) {
     if (page_num >= buffer_pool_->page_count()) {
@@ -134,7 +190,7 @@ RC HeapRecordManager::insert_record(Record &record)
       }
     }
 
-    PageHandle          handle;
+    PageHandle handle;
     rc = buffer_pool_->get_page_write(page_num, handle);
     if (OB_FAIL(rc)) {
       return rc;
@@ -148,13 +204,20 @@ RC HeapRecordManager::insert_record(Record &record)
       init_slotted_page(page);
     }
 
+    /// 崩溃后可能读到半写页，先校验页头再按里面的偏移写
+    rc = check_page(page, file_name_.c_str(), page_num);
+    if (OB_FAIL(rc)) {
+      return rc;
+    }
+
     SlotNum reuse = find_free_slot(page);
     /// 复用旧槽位不需要新的槽位目录空间
     const int32_t need = record_size_ + (reuse >= 0 ? 0 : static_cast<int32_t>(sizeof(int32_t)));
 
-    if (header->free_start + need <= header->free_end) {
-      SlotNum   slot   = reuse;
-      int32_t   offset = header->free_start;
+    /// 先减后比：free_start + need 在被读坏的页上可能溢出成负数而绕过检查
+    if (need <= header->free_end - header->free_start) {
+      SlotNum slot   = reuse;
+      int32_t offset = header->free_start;
       header->free_start += record_size_;
 
       if (reuse >= 0) {
@@ -162,7 +225,7 @@ RC HeapRecordManager::insert_record(Record &record)
       } else {
         slot = header->record_count;
         header->record_count += 1;
-        header->free_end     -= static_cast<int32_t>(sizeof(int32_t));
+        header->free_end -= static_cast<int32_t>(sizeof(int32_t));
       }
       *slot_at(page, slot) = offset;
       memcpy(page + offset, record.data(), record_size_);
@@ -193,7 +256,7 @@ RC HeapRecordManager::insert_record(Record &record)
       page_num = RECORD_FIRST_DATA_PAGE;
       wrapped  = true;
     } else {
-      wrapped = true;
+      wrapped  = true;
       page_num = buffer_pool_->page_count();  /// 越界，下一轮会新建一页
     }
   }
@@ -201,6 +264,8 @@ RC HeapRecordManager::insert_record(Record &record)
 
 RC HeapRecordManager::delete_record(const RID &rid)
 {
+  std::lock_guard<std::mutex> guard(latch_);
+
   if (!opened_) {
     return RC::RECORD_OPENNED;
   }
@@ -214,7 +279,12 @@ RC HeapRecordManager::delete_record(const RID &rid)
     return rc;
   }
 
-  char              *page   = handle.value();
+  char *page = handle.value();
+  rc         = check_page(page, file_name_.c_str(), rid.page_num);
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+
   SlottedPageHeader *header = page_header_of(page);
   if (rid.slot_num < 0 || rid.slot_num >= header->record_count) {
     return RC::RECORD_INVALID_RID;
@@ -227,11 +297,15 @@ RC HeapRecordManager::delete_record(const RID &rid)
 
   *slot = -1;
   header->deleted_count += 1;
-  handle.mark_dirty();
+  rc = handle.mark_dirty();
+  if (OB_FAIL(rc)) {
+    /// 只读池上 mark_dirty 会返回 IOERR_ACCESS：这里必须报错，不能返回成功却不落盘
+    return rc;
+  }
   handle.reset();
 
   RecordFileHeader file_header;
-  rc                = read_header(file_header);
+  rc = read_header(file_header);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -256,7 +330,12 @@ RC HeapRecordManager::get_record(const RID &rid, Record &record)
     return rc;
   }
 
-  const char          *page   = handle.const_data();
+  const char *page = handle.const_data();
+  rc               = check_page(page, file_name_.c_str(), rid.page_num);
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+
   const SlottedPageHeader *header = page_header_of(page);
   if (rid.slot_num < 0 || rid.slot_num >= header->record_count) {
     return RC::RECORD_INVALID_RID;
@@ -273,6 +352,8 @@ RC HeapRecordManager::get_record(const RID &rid, Record &record)
 
 RC HeapRecordManager::update_record(const RID &rid, const Record &record)
 {
+  std::lock_guard<std::mutex> guard(latch_);
+
   if (!opened_) {
     return RC::RECORD_OPENNED;
   }
@@ -289,7 +370,12 @@ RC HeapRecordManager::update_record(const RID &rid, const Record &record)
     return rc;
   }
 
-  char              *page   = handle.value();
+  char *page = handle.value();
+  rc         = check_page(page, file_name_.c_str(), rid.page_num);
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+
   SlottedPageHeader *header = page_header_of(page);
   if (rid.slot_num < 0 || rid.slot_num >= header->record_count) {
     return RC::RECORD_INVALID_RID;
@@ -306,11 +392,11 @@ RC HeapRecordManager::update_record(const RID &rid, const Record &record)
 
 RC HeapRecordManager::get_record_count(int64_t &count)
 {
-  RecordFileHeader header;
-  RC               rc = read_header(header);
-  if (OB_FAIL(rc)) {
-    return rc;
+  std::lock_guard<std::mutex> guard(latch_);
+
+  if (!opened_) {
+    return RC::RECORD_OPENNED;
   }
-  count = header.record_count;
+  count = header_.record_count;  /// 直接读缓存，不再每次都读表头页
   return RC::SUCCESS;
 }
