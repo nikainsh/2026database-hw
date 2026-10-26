@@ -254,7 +254,7 @@ RC FrameManager::acquire(DiskBufferPool *owner, PageNum page, FrameId *frame_id,
         return RC::BUFFERPOOL_CORRUPTED;
       }
       if (frame->isLoading()) {
-        cv_.wait(lock);
+        cv_.wait(lock, [frame]() { return !frame->isLoading(); });
         continue;
       }
       frame->increase_pin_count();
@@ -275,7 +275,7 @@ RC FrameManager::acquire(DiskBufferPool *owner, PageNum page, FrameId *frame_id,
       /// request never waits (prefetch is best-effort), so it cannot block
       /// stop()/close().
       if (!background && background_pins_.load(std::memory_order_relaxed) > 0) {
-        cv_.wait(lock);
+        cv_.wait(lock, [this]() { return background_pins_.load(std::memory_order_relaxed) == 0; });
         continue;
       }
       owner->stats_.no_buffer.fetch_add(1, std::memory_order_relaxed);
@@ -376,7 +376,10 @@ RC FrameManager::remove_page(DiskBufferPool *owner, PageNum page)
       /// cleaner), wait for them to drain. A real user pin still returns
       /// BUFFERPOOL_PAGE_PINNED immediately.
       if (frame->background_pin_count() > 0 && frame->pin_count() == frame->background_pin_count()) {
-        cv_.wait(lock);
+        cv_.wait(lock, [frame]() {
+          return frame->pin_count() == 0 || frame->background_pin_count() == 0 ||
+                 frame->pin_count() != frame->background_pin_count();
+        });
         continue;
       }
       return RC::BUFFERPOOL_PAGE_PINNED;
@@ -525,19 +528,30 @@ RC FrameManager::unpin(FrameId frame_id, bool background)
   if (frame == nullptr) {
     return RC::INVALID_ARGUMENT;
   }
-  const int old = frame->pin_count();
-  if (old <= 0) {
+
+  if (!background) {
+    /// Foreground waiters never wait for a user pin to disappear, so the hot
+    /// read path does not need the manager mutex.
+    if (frame->pin_count() <= 0) {
+      ASSERT(false, "unpin a page which is not pinned. frame=%d", frame_id);
+      return RC::INVALID_ARGUMENT;
+    }
+    frame->decrease_pin_count();
+    return RC::SUCCESS;
+  }
+
+  /// Background pins are waited on by acquire()/remove_page(). Update them
+  /// under the same mutex so a waiter cannot miss the notify between its
+  /// condition check and wait.
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (frame->pin_count() <= 0) {
     ASSERT(false, "unpin a page which is not pinned. frame=%d", frame_id);
     return RC::INVALID_ARGUMENT;
   }
-  if (background) {
-    frame->decrease_background_pin_count();
-    background_pins_.fetch_sub(1, std::memory_order_relaxed);
-  }
+  frame->decrease_background_pin_count();
+  background_pins_.fetch_sub(1, std::memory_order_relaxed);
   frame->decrease_pin_count();
-  if (background) {
-    cv_.notify_all();
-  }
+  cv_.notify_all();
   return RC::SUCCESS;
 }
 

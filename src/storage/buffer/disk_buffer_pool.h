@@ -194,6 +194,9 @@ private:
 
   RC read_page_raw(PageNum page_num, char *data);
   RC write_page_raw(PageNum page_num, const char *data);
+  RC read_page_raw_locked(PageNum page_num, char *data);
+  RC write_page_raw_locked(PageNum page_num, const char *data);
+  RC sync_data_file_locked();
   RC write_page_with_wal(PageNum page_num, const char *data);
   RC write_two_pages_with_wal(PageNum page_a, const char *data_a,
                               PageNum page_b, const char *data_b);
@@ -231,6 +234,10 @@ private:
 
   mutable std::mutex meta_mutex_;
   std::mutex         flush_mutex_;
+  /// Serializes every seek+fread/fwrite on handle_. Async prefetch reads a
+  /// file without holding meta_mutex_, so this cannot be folded into the
+  /// per-file metadata lock.
+  std::mutex         io_mutex_;
   std::atomic<int>   active_handles_{0};
 
   mutable BufferPoolStats stats_;
@@ -240,9 +247,8 @@ private:
  * @brief Manages all open buffer pools.
  *
  * A global frame budget (total_frame_limit) prevents "32 frames per file"
- * from growing without bound when many tables/indexes are open. Eviction is
- * still per-file; a later iteration can lift replacement to a truly global
- * frame manager.
+ * from growing without bound when many tables/indexes are open. Frames and
+ * victim selection are global; each file still has a per-file frame quota.
  */
 class DiskBufferPoolManager
 {

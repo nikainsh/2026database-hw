@@ -470,7 +470,7 @@ RC DiskBufferPool::seek(int64_t offset)
   return RC::SUCCESS;
 }
 
-RC DiskBufferPool::read_page_raw(PageNum page_num, char *data)
+RC DiskBufferPool::read_page_raw_locked(PageNum page_num, char *data)
 {
   RC rc = seek(static_cast<int64_t>(page_num) * BP_PAGE_SIZE);
   if (OB_FAIL(rc)) {
@@ -485,7 +485,13 @@ RC DiskBufferPool::read_page_raw(PageNum page_num, char *data)
   return RC::SUCCESS;
 }
 
-RC DiskBufferPool::write_page_raw(PageNum page_num, const char *data)
+RC DiskBufferPool::read_page_raw(PageNum page_num, char *data)
+{
+  std::lock_guard<std::mutex> guard(io_mutex_);
+  return read_page_raw_locked(page_num, data);
+}
+
+RC DiskBufferPool::write_page_raw_locked(PageNum page_num, const char *data)
 {
   RC rc = seek(static_cast<int64_t>(page_num) * BP_PAGE_SIZE);
   if (OB_FAIL(rc)) {
@@ -496,6 +502,12 @@ RC DiskBufferPool::write_page_raw(PageNum page_num, const char *data)
     return RC::IOERR_WRITE;
   }
   return RC::SUCCESS;
+}
+
+RC DiskBufferPool::write_page_raw(PageNum page_num, const char *data)
+{
+  std::lock_guard<std::mutex> guard(io_mutex_);
+  return write_page_raw_locked(page_num, data);
 }
 
 RC DiskBufferPool::write_page_with_wal(PageNum page_num, const char *data)
@@ -539,11 +551,15 @@ RC DiskBufferPool::write_two_pages_with_wal(PageNum page_a, const char *data_a,
     stats_.wal_syncs.fetch_add(1, std::memory_order_relaxed);
   }
 
-  RC rc = write_page_raw(page_a, data_a);
+  /// Keep both writes under one io_mutex_ section: a concurrent reader must
+  /// not observe the new header before the corresponding data page is zeroed
+  /// or linked into the free list.
+  std::lock_guard<std::mutex> io_guard(io_mutex_);
+  RC rc = write_page_raw_locked(page_a, data_a);
   if (OB_FAIL(rc)) {
     return rc;
   }
-  rc = write_page_raw(page_b, data_b);
+  rc = write_page_raw_locked(page_b, data_b);
   if (OB_FAIL(rc)) {
     return rc;
   }
@@ -551,7 +567,7 @@ RC DiskBufferPool::write_two_pages_with_wal(PageNum page_a, const char *data_a,
   return RC::SUCCESS;
 }
 
-RC DiskBufferPool::sync_data_file()
+RC DiskBufferPool::sync_data_file_locked()
 {
   if (handle_ == nullptr) {
     return RC::FILE_NOT_OPENED;
@@ -564,6 +580,12 @@ RC DiskBufferPool::sync_data_file()
     LOG_ERROR("failed to sync data file. file=%s, rc=%s", file_name_.c_str(), strrc(rc));
   }
   return rc;
+}
+
+RC DiskBufferPool::sync_data_file()
+{
+  std::lock_guard<std::mutex> guard(io_mutex_);
+  return sync_data_file_locked();
 }
 
 void DiskBufferPool::lock_frame_shared(FrameId frame_id)
