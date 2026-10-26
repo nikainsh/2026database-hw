@@ -224,6 +224,7 @@ private:
   int64_t count_ = 0;
   int64_t int_sum_ = 0;
   double  real_sum_ = 0.0;
+  double  real_compensation_ = 0.0;
   Value   extreme_;
   bool    has_extreme_ = false;
 };

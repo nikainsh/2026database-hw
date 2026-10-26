@@ -256,6 +256,68 @@ static void test_integer_sum_limits()
   }
 }
 
+static void test_real_aggregate_limits()
+{
+  auto check = [](AggFunc func, AttrType type, const std::vector<Value> &values, RC expected, float answer) {
+    RefValue column(0,type); AggregateState state;
+    CHECK(state.init(func,&column,"real_limits") == RC::SUCCESS);
+    for (const Value &value : values) {
+      Tuple row; row.append(value,ColumnRef(0,0)); CHECK(state.accumulate(row) == RC::SUCCESS);
+    }
+    Value result(123.0f);
+    CHECK(state.result(result) == expected);
+    CHECK(result.type() == AttrType::FLOAT);
+    if (expected == RC::SUCCESS) CHECK(std::isfinite(result.get_float()) && result.get_float() == answer);
+    else CHECK(result.get_float() == 123.0f); // Do not publish an invalid result.
+  };
+  const float high = std::numeric_limits<float>::max();
+  const int64_t big_high = std::numeric_limits<int64_t>::max(), big_low = std::numeric_limits<int64_t>::min();
+  check(AggFunc::AVG,AttrType::INT,{Value(16777217),Value(-16777216)},RC::SUCCESS,0.5f);
+  check(AggFunc::AVG,AttrType::BIGINT,{Value(int64_t(9007199254740993LL)),Value(int64_t(-9007199254740992LL))},RC::SUCCESS,0.5f);
+  check(AggFunc::AVG,AttrType::BIGINT,{Value(big_high),Value(big_low)},RC::SUCCESS,-0.5f);
+  check(AggFunc::AVG,AttrType::BIGINT,{Value(big_low),Value(big_high)},RC::SUCCESS,-0.5f);
+  check(AggFunc::AVG,AttrType::BIGINT,{Value(big_high),Value(big_high)},RC::SUCCESS,static_cast<float>(big_high));
+  check(AggFunc::AVG,AttrType::BIGINT,{Value(big_low),Value(big_low)},RC::SUCCESS,static_cast<float>(big_low));
+  check(AggFunc::SUM,AttrType::FLOAT,{Value(high)},RC::SUCCESS,high);
+  check(AggFunc::SUM,AttrType::FLOAT,{Value(-high)},RC::SUCCESS,-high);
+  check(AggFunc::SUM,AttrType::FLOAT,{Value(high),Value(high)},RC::NUMERIC_OVERFLOW,0);
+  check(AggFunc::SUM,AttrType::FLOAT,{Value(-high),Value(-high)},RC::NUMERIC_OVERFLOW,0);
+  check(AggFunc::SUM,AttrType::FLOAT,{Value(high),Value(high),Value(-high)},RC::SUCCESS,high);
+  check(AggFunc::SUM,AttrType::FLOAT,{Value(1e20f),Value(1.0f),Value(-1e20f)},RC::SUCCESS,1.0f);
+  check(AggFunc::AVG,AttrType::FLOAT,{Value(1e20f),Value(1.0f),Value(-1e20f)},RC::SUCCESS,1.0f/3.0f);
+  check(AggFunc::AVG,AttrType::FLOAT,{Value(high),Value(high)},RC::SUCCESS,high); // Average fits even when the FLOAT sum does not.
+  for (AggFunc func : {AggFunc::SUM,AggFunc::AVG}) {
+    for (float invalid : {std::numeric_limits<float>::infinity(),-std::numeric_limits<float>::infinity(),std::numeric_limits<float>::quiet_NaN()}) {
+      RefValue column(0,AttrType::FLOAT); AggregateState state; CHECK(state.init(func,&column,"nonfinite") == RC::SUCCESS);
+      auto row = [](float n) { Tuple tuple; tuple.append(Value(n),ColumnRef(0,0)); return tuple; };
+      CHECK(state.accumulate(row(1.0f)) == RC::SUCCESS);
+      CHECK(state.accumulate(row(invalid)) == RC::NUMERIC_OVERFLOW);
+      CHECK(state.accumulate(row(3.0f)) == RC::SUCCESS);
+      Value result; CHECK(state.result(result) == RC::SUCCESS && result.get_float() == (func == AggFunc::SUM ? 4.0f : 2.0f));
+    }
+  }
+  for (bool grouped : {false,true}) for (bool negative : {false,true}) for (bool close_fails : {false,true}) {
+    RefValue group(0,AttrType::INT);
+    AggregateExpression sum(AggFunc::SUM,std::make_unique<RefValue>(1,AttrType::FLOAT));
+    std::unique_ptr<PhysicalOperator> plan;
+    if (grouped) plan = std::make_unique<HashGroupByOperator>(std::vector<Expression *>{&group,&sum},std::vector<Expression *>{&group});
+    else plan = std::make_unique<ScalarGroupByOperator>(std::vector<Expression *>{&sum});
+    Rows input;
+    if (grouped) input.push_back({Value(0),Value(1.0f)});
+    const Value huge(negative ? -high : high);
+    input.push_back({Value(1),huge}); input.push_back({Value(1),huge});
+    auto source = std::make_unique<RowSource>(input); auto *leaf = source.get();
+    if (close_fails) leaf->close_error = RC::IOERR_CLOSE;
+    plan->add_child(std::move(source)); QueryEngine engine(nullptr); Capture out;
+    CHECK(run(*plan,out,engine) == RC::NUMERIC_OVERFLOW && out.summary.code == RC::NUMERIC_OVERFLOW);
+    CHECK(out.rows.size() == static_cast<size_t>(grouped ? 1 : 0)); // Earlier groups may already have streamed, but no inf is emitted.
+    CHECK(!leaf->active && leaf->closes == 1 && plan->close() == RC::SUCCESS && leaf->closes == 1);
+    leaf->close_error = RC::SUCCESS; leaf->replace_rows(Rows{{Value(1),Value(1.0f)},{Value(1),Value(1.0f)}});
+    CHECK(run(*plan,out,engine) == RC::SUCCESS && out.rows.size() == 1 && out.rows[0][grouped ? 1 : 0].get_float() == 2.0f);
+    CHECK(!leaf->active && leaf->opens == 2 && leaf->closes == 2);
+  }
+}
+
 static void test_group_keys()
 {
   QueryEngine engine(nullptr);
@@ -440,6 +502,45 @@ static void test_real_sql()
   }
   sql("select sum(v) from profile_sum_limits");
   CHECK(writer.rows.size() == 1 && writer.rows[0][0].get_int64() == -1);
+
+  sql("drop table if exists profile_avg_precision");
+  sql("create table profile_avg_precision (g int, v int)");
+  sql("insert into profile_avg_precision values (1,16777217),(1,-16777216)");
+  sql("select sum(v),avg(v) from profile_avg_precision");
+  CHECK(writer.rows.size() == 1 && writer.rows[0][0].get_int64() == 1 && writer.rows[0][1].get_float() == 0.5f);
+  sql("select g,avg(v) from profile_avg_precision group by g");
+  CHECK(writer.rows.size() == 1 && writer.rows[0][1].get_float() == 0.5f);
+  sql("drop table if exists profile_big_avg");
+  sql("create table profile_big_avg (g int,v bigint)");
+  sql("insert into profile_big_avg values (1,9007199254740993),(1,-9007199254740992)");
+  sql("select avg(v) from profile_big_avg"); CHECK(writer.rows[0][0].get_float() == 0.5f);
+  sql("select g,avg(v) from profile_big_avg group by g"); CHECK(writer.rows[0][1].get_float() == 0.5f);
+  sql("drop table if exists profile_float_limits");
+  sql("create table profile_float_limits (g int,v float)");
+  for (bool negative : {false,true}) {
+    sql("delete from profile_float_limits");
+    const std::string n = negative ? "-300000000000000000000000000000000000000.0" : "300000000000000000000000000000000000000.0";
+    sql("insert into profile_float_limits values (0,0.0),(1," + n + "),(1," + n + ")");
+    for (const char *text : {"select sum(v) from profile_float_limits", "select g,sum(v) from profile_float_limits group by g"}) {
+      writer.rows.clear(); SqlResult result;
+      CHECK(engine.execute(text,writer,result) == RC::NUMERIC_OVERFLOW && writer.summary.code == RC::NUMERIC_OVERFLOW);
+      for (const auto &row : writer.rows) for (const auto &value : row) if (value.type() == AttrType::FLOAT) CHECK(std::isfinite(value.get_float()));
+    }
+    sql("select g,avg(v) from profile_float_limits group by g");
+    CHECK(writer.rows.size() == 2);
+    bool saw_large = false;
+    for (const auto &row : writer.rows) {
+      CHECK(std::isfinite(row[1].get_float()));
+      if (row[0].get_int32() == 1) {
+        CHECK(row[1].get_float() == (negative ? -3e38f : 3e38f)); saw_large = true;
+      } else CHECK(row[0].get_int32() == 0 && row[1].get_float() == 0.0f);
+    }
+    CHECK(saw_large);
+  }
+  sql("delete from profile_float_limits");
+  sql("insert into profile_float_limits values (1,1.5),(1,-0.5)");
+  sql("select sum(v),avg(v) from profile_float_limits");
+  CHECK(writer.rows[0][0].get_float() == 1.0f && writer.rows[0][1].get_float() == 0.5f);
   CHECK(db->close() == RC::SUCCESS);
 }
 
@@ -451,6 +552,7 @@ int main(int argc, char **argv)
     test_filter_project();
     test_scalar();
     test_integer_sum_limits();
+    test_real_aggregate_limits();
     test_group_keys();
     test_aggregate_failure_cleanup();
     test_join_statistics();

@@ -4,6 +4,7 @@
 
 #include <sstream>
 #include <limits>
+#include <cmath>
 
 #include "common/log.h"
 #include "common/string_util.h"
@@ -407,6 +408,29 @@ std::string AggregateExpression::describe() const
 // AggregateState
 // ---------------------------------------------------------------------------
 
+// Neumaier summation retains low-order terms when large values cancel. Work on
+// local candidates so an invalid input leaves the aggregate state unchanged.
+static RC add_real_term(double value, double &sum, double &compensation)
+{
+  if (!std::isfinite(value)) return RC::NUMERIC_OVERFLOW;
+  const double next = sum + value;
+  if (!std::isfinite(next)) return RC::NUMERIC_OVERFLOW;
+  const double lost = std::fabs(sum) >= std::fabs(value) ? (sum - next) + value : (value - next) + sum;
+  const double corrected = compensation + lost;
+  if (!std::isfinite(corrected)) return RC::NUMERIC_OVERFLOW;
+  sum = next;
+  compensation = corrected;
+  return RC::SUCCESS;
+}
+
+static RC float_aggregate_result(double number, Value &value)
+{
+  const double limit = static_cast<double>(std::numeric_limits<float>::max());
+  if (!std::isfinite(number) || number > limit || number < -limit) return RC::NUMERIC_OVERFLOW;
+  value = Value(static_cast<float>(number));
+  return RC::SUCCESS;
+}
+
 RC AggregateState::init(AggFunc func, const Expression *arg, const std::string &display_name)
 {
   func_          = func;
@@ -416,6 +440,7 @@ RC AggregateState::init(AggFunc func, const Expression *arg, const std::string &
   count_         = 0;
   int_sum_       = 0;
   real_sum_      = 0.0;
+  real_compensation_ = 0.0;
   extreme_       = Value();
   has_extreme_   = false;
 
@@ -455,7 +480,8 @@ RC AggregateState::accumulate(const Tuple &tuple)
         return rc;
       }
       if (result_type_ == AttrType::FLOAT) {
-        real_sum_ += staged.get_float();
+        rc = add_real_term(staged.get_float(), real_sum_, real_compensation_);
+        if (OB_FAIL(rc)) return rc;
       } else {
         const int64_t addend = staged.get_int64();
         // Check before adding: signed overflow itself is undefined behavior.
@@ -470,12 +496,22 @@ RC AggregateState::accumulate(const Tuple &tuple)
       break;
     }
     case AggFunc::AVG: {
-      Value staged;
-      rc = value.cast_to(AttrType::FLOAT, staged);
-      if (OB_FAIL(rc)) {
-        return rc;
+      double sum = real_sum_, compensation = real_compensation_;
+      if (value.type() == AttrType::INT || value.type() == AttrType::BIGINT || value.type() == AttrType::BOOLEAN) {
+        // Both parts are exactly representable as doubles, even for BIGINT MIN
+        // and MAX. Do not first round the entire input to float (or double).
+        constexpr int64_t base = int64_t(1) << 32;
+        const int64_t integer = value.get_int64();
+        rc = add_real_term(static_cast<double>(integer / base) * static_cast<double>(base), sum, compensation);
+        if (OB_SUCC(rc)) rc = add_real_term(static_cast<double>(integer % base), sum, compensation);
+      } else {
+        Value staged;
+        rc = value.cast_to(AttrType::FLOAT, staged);
+        if (OB_SUCC(rc)) rc = add_real_term(staged.get_float(), sum, compensation);
       }
-      real_sum_ += staged.get_float();
+      if (OB_FAIL(rc)) return rc;
+      real_sum_ = sum;
+      real_compensation_ = compensation;
       break;
     }
     case AggFunc::MIN:
@@ -510,14 +546,13 @@ RC AggregateState::result(Value &value) const
       if (count_ == 0) {
         value = result_type_ == AttrType::FLOAT ? Value(0.0f) : Value(static_cast<int64_t>(0));
       } else if (result_type_ == AttrType::FLOAT) {
-        value = Value(static_cast<float>(real_sum_));
+        return float_aggregate_result(real_sum_ + real_compensation_, value);
       } else {
         value = Value(int_sum_);
       }
       return RC::SUCCESS;
     case AggFunc::AVG:
-      value = Value(count_ == 0 ? 0.0f : static_cast<float>(real_sum_ / static_cast<double>(count_)));
-      return RC::SUCCESS;
+      return float_aggregate_result(count_ == 0 ? 0.0 : (real_sum_ + real_compensation_) / static_cast<double>(count_), value);
     case AggFunc::MIN:
     case AggFunc::MAX:
       if (!has_extreme_) {
