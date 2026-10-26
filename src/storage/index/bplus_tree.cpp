@@ -723,6 +723,13 @@ RC BplusTree::collect_stats(int64_t &entries, int64_t &distinct_keys, std::strin
   }
 
   max_key = previous;
+
+  /// 叶子链上的条目数必须与树头一致，否则说明树结构本身有问题，统计不能用
+  if (entries != header_.entry_count) {
+    LOG_ERROR("entry count mismatch while collecting stats. file=%s, scanned=%lld, header=%lld",
+              file_name_.c_str(), static_cast<long long>(entries), static_cast<long long>(header_.entry_count));
+    return RC::INTERNAL;
+  }
   return RC::SUCCESS;
 }
 

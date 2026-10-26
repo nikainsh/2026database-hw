@@ -113,6 +113,8 @@ public:
   int64_t entry_count() const { return header_.entry_count; }
   /// 沿叶子链统计：条目数、不同键数、最小/最大键。供优化器估算选择率使用。
   RC collect_stats(int64_t &entries, int64_t &distinct_keys, std::string &min_key, std::string &max_key) const;
+  /// 按列类型语义比较两个定长键（Table 增量维护 min/max 时需要，避免误解 int/float 的字节序）
+  int compare_key_bytes(const char *left, const char *right) const { return compare_keys(left, right); }
   int     key_len() const { return header_.key_len; }
   bool    unique() const { return header_.unique_flag != 0; }
   AttrType key_type() const { return static_cast<AttrType>(header_.key_type); }

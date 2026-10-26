@@ -152,6 +152,11 @@ RC Table::insert_record(Record &record)
     }
     changes.on_insert(index.get(), record.data(), record.len(), record.rid());
   }
+
+  /// 全部索引都写成功之后才动统计，避免回滚后 min/max 里留下没写进去的键
+  for (auto &index : indexes_) {
+    update_stats_on_insert(*index, record.data());
+  }
   return RC::SUCCESS;
 }
 
@@ -182,6 +187,10 @@ RC Table::delete_record(const RID &rid)
   if (OB_FAIL(rc)) {
     changes.rollback();
     return rc;
+  }
+
+  for (auto &index : indexes_) {
+    update_stats_on_delete(*index, old.data());
   }
   return RC::SUCCESS;
 }
@@ -231,6 +240,17 @@ RC Table::update_record(const RID &rid, const Record &record)
     changes.rollback();
     return rc;
   }
+
+  /// 被索引列的值换了，旧的 min/max/NDV 可能都不对了：直接让统计失效，下次规划时重采
+  for (auto &index : indexes_) {
+    const ColumnMeta *column = index->index_column();
+    if (column == nullptr) {
+      continue;
+    }
+    if (memcmp(old.data() + column->offset(), record.data() + column->offset(), column->data_len()) != 0) {
+      invalidate_stats(*index);
+    }
+  }
   return RC::SUCCESS;
 }
 
@@ -243,25 +263,32 @@ RC Table::record_count(int64_t &count) { return record_manager_->get_record_coun
 RC Table::ensure_index_stats()
 {
   for (const IndexMeta &meta : meta_.indexes()) {
-    Index             *index = index_by_name(meta.index_name);
+    Index *index = index_by_name(meta.index_name);
     if (index == nullptr) {
       continue;
     }
 
+    int64_t  current_entries = 0;
+    const RC count_rc        = index->entry_count(current_entries);
+    if (OB_FAIL(count_rc)) {
+      LOG_WARN("failed to read index entry count. table=%s, index=%s, rc=%s",
+               meta_.table_name().c_str(), meta.index_name.c_str(), strrc(count_rc));
+      continue;
+    }
+
     const IndexStats *existing = meta_.index_stats(meta.index_name);
-    if (existing != nullptr && existing->valid) {
-      /// 条目数是 O(1) 的实时值；NDV 与最小最大键沿用上次采集（本实现不做自动失效）
-      IndexStats fresh  = *existing;
-      int64_t    entries = 0;
-      if (OB_SUCC(index->entry_count(entries))) {
-        fresh.entries = entries;
-        meta_.set_index_stats(meta.index_name, fresh);
-      }
+    /// 没采过、被 DML 标了失效、或者条目数相对采集时漂移超过阈值，才做 O(条目数) 的全量采集
+    const bool resample = (existing == nullptr) || existing->drifted(current_entries);
+    if (!resample) {
+      /// 条目数是 O(1) 的实时值，先刷新；NDV 与最小最大键沿用上次采集
+      IndexStats fresh = *existing;
+      fresh.entries    = current_entries;
+      meta_.set_index_stats(meta.index_name, fresh);
       continue;
     }
 
     IndexStats stats;
-    RC         rc = index->collect_stats(stats);
+    const RC   rc = index->collect_stats(stats);
     if (OB_FAIL(rc)) {
       LOG_WARN("failed to collect index stats. table=%s, index=%s, rc=%s",
                meta_.table_name().c_str(), meta.index_name.c_str(), strrc(rc));
@@ -270,6 +297,75 @@ RC Table::ensure_index_stats()
     meta_.set_index_stats(meta.index_name, stats);
   }
   return RC::SUCCESS;
+}
+
+void Table::update_stats_on_insert(Index &index, const char *record_data)
+{
+  const std::string &index_name = index.index_meta().index_name;
+  const IndexStats  *current    = meta_.index_stats(index_name);
+  if (current == nullptr || !current->valid) {
+    return;  /// 还没采过统计，等优化器第一次 ensure 时全量采集
+  }
+
+  IndexStats        stats = *current;
+  const std::string key   = index.key_of_record(record_data);
+
+  if (stats.min_key.empty() || stats.max_key.empty()) {
+    stats.min_key = key;
+    stats.max_key = key;
+  } else {
+    if (index.compare_key(key.data(), stats.min_key.data()) < 0) {
+      stats.min_key = key;
+    }
+    if (index.compare_key(key.data(), stats.max_key.data()) > 0) {
+      stats.max_key = key;
+    }
+  }
+
+  /// 唯一索引每插入一条就是一个新键，NDV 可以精确 +1；非唯一索引的 NDV 等漂移重采样时修正。
+  /// 注意这里**不**动 entries：它是漂移判断的基线（sampled_entries）所指的那个数，
+  /// 由 ensure_index_stats() 用索引头 O(1) 刷新，提前改会让漂移永远看起来是 0。
+  if (index.index_meta().unique) {
+    stats.distinct_keys += 1;
+  }
+  meta_.set_index_stats(index_name, stats);
+}
+
+void Table::update_stats_on_delete(Index &index, const char *record_data)
+{
+  const std::string &index_name = index.index_meta().index_name;
+  const IndexStats  *current    = meta_.index_stats(index_name);
+  if (current == nullptr || !current->valid) {
+    return;
+  }
+
+  IndexStats        stats = *current;
+  const std::string key   = index.key_of_record(record_data);
+
+  /// 删掉的正好是最小/最大键：新的极值要扫叶子才知道，直接让统计失效
+  if ((!stats.min_key.empty() && index.compare_key(key.data(), stats.min_key.data()) == 0) ||
+      (!stats.max_key.empty() && index.compare_key(key.data(), stats.max_key.data()) == 0)) {
+    invalidate_stats(index);
+    return;
+  }
+
+  if (index.index_meta().unique && stats.distinct_keys > 0) {
+    stats.distinct_keys -= 1;
+  }
+  meta_.set_index_stats(index_name, stats);
+}
+
+void Table::invalidate_stats(Index &index)
+{
+  const std::string &index_name = index.index_meta().index_name;
+  const IndexStats  *current    = meta_.index_stats(index_name);
+  if (current == nullptr || !current->valid) {
+    return;
+  }
+
+  IndexStats stats = *current;
+  stats.valid      = false;
+  meta_.set_index_stats(index_name, stats);
 }
 
 /**

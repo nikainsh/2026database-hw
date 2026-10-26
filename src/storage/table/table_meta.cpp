@@ -2,6 +2,7 @@
 
 #include "storage/table/table_meta.h"
 
+#include <algorithm>
 #include <cstring>
 #include <sstream>
 
@@ -42,7 +43,7 @@ void IndexStats::serialize(BinaryWriter &w) const
 
 RC IndexStats::deserialize(BinaryReader &r, IndexStats &stats)
 {
-  stats = IndexStats();
+  stats       = IndexStats();
   stats.valid = r.get_bool();
   if (!r.ok()) {
     return RC::IOERR_READ;
@@ -50,11 +51,24 @@ RC IndexStats::deserialize(BinaryReader &r, IndexStats &stats)
   if (!stats.valid) {
     return RC::SUCCESS;
   }
-  stats.entries       = r.get_i64();
-  stats.distinct_keys = r.get_i64();
-  stats.min_key       = r.get_string();
-  stats.max_key       = r.get_string();
+  stats.entries         = r.get_i64();
+  stats.distinct_keys   = r.get_i64();
+  stats.min_key         = r.get_string();
+  stats.max_key         = r.get_string();
+  /// catalog 里存的是上次采集时的快照，重启后就以它为漂移基线
+  stats.sampled_entries = stats.entries;
   return r.ok() ? RC::SUCCESS : RC::IOERR_READ;
+}
+
+bool IndexStats::drifted(int64_t current_entries) const
+{
+  if (!valid) {
+    return true;
+  }
+  const int64_t sampled = sampled_entries > 0 ? sampled_entries : entries;
+  const int64_t delta   = current_entries > sampled ? current_entries - sampled : sampled - current_entries;
+  const int64_t limit   = std::max<int64_t>(64, sampled / 10);
+  return delta > limit;
 }
 
 // ---------------------------------------------------------------------------

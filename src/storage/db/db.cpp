@@ -265,6 +265,16 @@ RC Db::close()
     LOG_ERROR("failed to flush db on close. db=%s, rc=%s", db_name_.c_str(), strrc(rc));
   }
 
+  /// 索引统计（IndexStats）只存在内存里，跟着 catalog 一起落盘。
+  /// 这样重启后 CBO 能直接复用上次采集的统计，不必每张表重新扫一遍索引叶子。
+  if (!tables_.empty()) {
+    const RC catalog_rc = write_catalog();
+    if (OB_FAIL(catalog_rc)) {
+      LOG_ERROR("failed to persist catalog on close. db=%s, rc=%s", db_name_.c_str(), strrc(catalog_rc));
+      rc = catalog_rc;
+    }
+  }
+
   tables_.clear();
   if (buffer_pool_manager_) {
     RC one = buffer_pool_manager_->close();

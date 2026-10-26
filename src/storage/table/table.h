@@ -57,6 +57,16 @@ private:
   /// 建索引失败时回滚：删元数据、关缓冲池里的文件、删磁盘文件与页级 WAL
   RC rollback_index_creation(const std::string &index_name);
 
+  // ---- 索引统计（IndexStats）的增量维护 ----
+  // 全量采集要扫一遍叶子链（O(条目数)），所以平时只在内存里 O(1) 地修：
+  //   * 插入：更新 min/max；唯一索引的 NDV 精确 +1
+  //   * 删除：删掉的是极值就让统计失效（新极值要扫叶子才知道），否则条目数 -1
+  //   * 更新：被索引列变了就让统计失效
+  // 失效的统计会在下一次 ensure_index_stats()（优化器规划时调用）按需重采。
+  void update_stats_on_insert(Index &index, const char *record_data);
+  void update_stats_on_delete(Index &index, const char *record_data);
+  void invalidate_stats(Index &index);
+
 private:
   TableMeta                            meta_;
   std::string                          dir_;

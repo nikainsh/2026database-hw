@@ -37,6 +37,11 @@ public:
   /// 采集统计信息（条目数/NDV/最小最大键），供优化器估算选择率
   virtual RC collect_stats(IndexStats &stats) const = 0;
 
+  /// 从一条记录数据里取出这个索引的定长键（Table 用来增量维护 min/max 统计）
+  std::string key_of_record(const char *record_data) const { return key_of(record_data); }
+  /// 按列类型语义比较两个定长键（数值按数值序，char 按字节序）
+  virtual int compare_key(const char *left, const char *right) const = 0;
+
   /// 把定长索引键还原成值，代价估算里对范围条件做插值时用
   RC decode_key(const std::string &key, Value &value) const;
 
@@ -63,6 +68,7 @@ public:
                   const Value *high, bool high_inclusive) const override;
   RC entry_count(int64_t &count) const override;
   RC collect_stats(IndexStats &stats) const override;
+  int compare_key(const char *left, const char *right) const override;
 
   BplusTree       &tree() { return tree_; }
   const BplusTree &tree() const { return tree_; }

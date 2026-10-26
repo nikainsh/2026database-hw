@@ -19,6 +19,14 @@ struct IndexStats
   std::string min_key;
   std::string max_key;
 
+  /// 采集这批统计时的条目数（**只在内存里**，不写进 catalog）：
+  /// 用来判断 DML 之后统计漂移了多少，超过阈值才重新扫一遍叶子。
+  /// 从 catalog 反序列化时按当时读到的 entries 初始化。
+  int64_t sampled_entries = 0;
+
+  /// 当前条目数相对采集时是否已经漂移得太多（10% 或 64 条，取大者）
+  bool drifted(int64_t current_entries) const;
+
   void serialize(BinaryWriter &w) const;
   static RC deserialize(BinaryReader &r, IndexStats &stats);
 };

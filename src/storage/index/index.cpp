@@ -99,6 +99,11 @@ RC BplusTreeIndex::entry_count(int64_t &count) const
   return RC::SUCCESS;
 }
 
+int BplusTreeIndex::compare_key(const char *left, const char *right) const
+{
+  return tree_.compare_key_bytes(left, right);
+}
+
 RC BplusTreeIndex::collect_stats(IndexStats &stats) const
 {
   int64_t entries       = 0;
@@ -110,11 +115,12 @@ RC BplusTreeIndex::collect_stats(IndexStats &stats) const
     return rc;
   }
 
-  stats.valid         = true;
-  stats.entries       = entries;
-  stats.distinct_keys = distinct_keys;
-  stats.min_key       = min_key;
-  stats.max_key       = max_key;
+  stats.valid           = true;
+  stats.entries         = entries;
+  stats.distinct_keys   = distinct_keys;
+  stats.min_key         = min_key;
+  stats.max_key         = max_key;
+  stats.sampled_entries = entries;  /// 漂移基线：下次条目数变化超过阈值才会重采
   return RC::SUCCESS;
 }
 
