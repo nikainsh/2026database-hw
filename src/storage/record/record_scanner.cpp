@@ -64,7 +64,14 @@ RC RecordScanner::next(Record &record)
       const SlotNum slot   = next_slot_;
       ++next_slot_;
 
-      if (offset != -1) {
+      /// 负值 = 已删除（绝对值是记录体原偏移，供原地复用），不参与扫描
+      if (!slot_is_deleted(offset)) {
+        if (offset < static_cast<int32_t>(sizeof(SlottedPageHeader)) || offset + record_size_ > BP_PAGE_SIZE) {
+          LOG_ERROR("invalid slot offset. file=%s, page=%d, slot=%d, offset=%d",
+                    buffer_pool_->file_name().c_str(), current_page_, slot, offset);
+          handle_.reset();
+          return RC::BUFFERPOOL_CORRUPTED;
+        }
         record.set_rid(current_page_, slot);
         ++scanned_;
         return record.copy_data(page + offset, record_size_);

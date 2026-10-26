@@ -211,22 +211,40 @@ RC HeapRecordManager::insert_record(Record &record)
     }
 
     SlotNum reuse = find_free_slot(page);
-    /// 复用旧槽位不需要新的槽位目录空间
-    const int32_t need = record_size_ + (reuse >= 0 ? 0 : static_cast<int32_t>(sizeof(int32_t)));
+    /// 复用已删槽位分两种：
+    ///   * 新格式存的是 -offset：记录体原地覆写，不占新空间（记录定长、从不搬移）
+    ///   * 旧格式只有 -1：偏移丢了，记录体要重新分配，但槽位目录那 4 字节仍然复用
+    const bool    can_reuse_body = (reuse >= 0) && slot_has_reusable_offset(slot_value_at(page, reuse));
+    const int32_t need          = can_reuse_body
+                                      ? 0
+                                      : record_size_ + (reuse >= 0 ? 0 : static_cast<int32_t>(sizeof(int32_t)));
 
     /// 先减后比：free_start + need 在被读坏的页上可能溢出成负数而绕过检查
     if (need <= header->free_end - header->free_start) {
       SlotNum slot   = reuse;
-      int32_t offset = header->free_start;
-      header->free_start += record_size_;
+      int32_t offset = 0;
 
-      if (reuse >= 0) {
+      if (can_reuse_body) {
+        offset = slot_deleted_offset(slot_value_at(page, reuse));
+        /// 槽位指向的位置必须落在本页记录区内（半写页/坏页时不要照着写）
+        if (offset < static_cast<int32_t>(sizeof(SlottedPageHeader)) || offset + record_size_ > BP_PAGE_SIZE) {
+          LOG_ERROR("invalid slot offset. file=%s, page=%d, slot=%d, offset=%d",
+                    file_name_.c_str(), page_num, reuse, offset);
+          return RC::BUFFERPOOL_CORRUPTED;
+        }
         header->deleted_count -= 1;
       } else {
-        slot = header->record_count;
-        header->record_count += 1;
-        header->free_end -= static_cast<int32_t>(sizeof(int32_t));
+        offset = header->free_start;
+        header->free_start += record_size_;
+        if (reuse >= 0) {
+          header->deleted_count -= 1;  /// 旧格式删除标记：只能复用槽位，不能复用记录体
+        } else {
+          slot = header->record_count;
+          header->record_count += 1;
+          header->free_end -= static_cast<int32_t>(sizeof(int32_t));
+        }
       }
+
       *slot_at(page, slot) = offset;
       memcpy(page + offset, record.data(), record_size_);
 
@@ -291,11 +309,17 @@ RC HeapRecordManager::delete_record(const RID &rid)
   }
 
   int32_t *slot = slot_at(page, rid.slot_num);
-  if (*slot == -1) {
+  if (slot_is_deleted(*slot)) {
     return RC::RECORD_NOT_EXIST;
   }
+  if (*slot < static_cast<int32_t>(sizeof(SlottedPageHeader)) || *slot + record_size_ > BP_PAGE_SIZE) {
+    LOG_ERROR("invalid slot offset. file=%s, page=%d, slot=%d, offset=%d",
+              file_name_.c_str(), rid.page_num, rid.slot_num, *slot);
+    return RC::BUFFERPOOL_CORRUPTED;
+  }
 
-  *slot = -1;
+  /// 用「负的偏移」表示已删除：绝对值保留记录体位置，后续插入可以原地复用这块空间
+  *slot = -(*slot);
   header->deleted_count += 1;
   rc = handle.mark_dirty();
   if (OB_FAIL(rc)) {
@@ -342,8 +366,13 @@ RC HeapRecordManager::get_record(const RID &rid, Record &record)
   }
 
   const int32_t offset = slot_value_at(page, rid.slot_num);
-  if (offset == -1) {
+  if (slot_is_deleted(offset)) {
     return RC::RECORD_NOT_EXIST;
+  }
+  if (offset < static_cast<int32_t>(sizeof(SlottedPageHeader)) || offset + record_size_ > BP_PAGE_SIZE) {
+    LOG_ERROR("invalid slot offset. file=%s, page=%d, slot=%d, offset=%d",
+              file_name_.c_str(), rid.page_num, rid.slot_num, offset);
+    return RC::BUFFERPOOL_CORRUPTED;
   }
 
   record.set_rid(rid);
@@ -382,8 +411,13 @@ RC HeapRecordManager::update_record(const RID &rid, const Record &record)
   }
 
   const int32_t offset = slot_value_at(page, rid.slot_num);
-  if (offset == -1) {
+  if (slot_is_deleted(offset)) {
     return RC::RECORD_NOT_EXIST;
+  }
+  if (offset < static_cast<int32_t>(sizeof(SlottedPageHeader)) || offset + record_size_ > BP_PAGE_SIZE) {
+    LOG_ERROR("invalid slot offset. file=%s, page=%d, slot=%d, offset=%d",
+              file_name_.c_str(), rid.page_num, rid.slot_num, offset);
+    return RC::BUFFERPOOL_CORRUPTED;
   }
 
   memcpy(page + offset, record.data(), record_size_);

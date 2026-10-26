@@ -44,6 +44,26 @@ inline int32_t slot_value_at(const char *page, SlotNum slot)
   return *slot_at(const_cast<char *>(page), slot);
 }
 
+/**
+ * @brief 槽位值的编码
+ * @details `>= sizeof(SlottedPageHeader)` 表示记录体在页内的偏移；`< 0` 表示该槽位已删除。
+ *          新写入的删除标记是 `-offset`（绝对值 = 记录体原偏移），所以删除后还能**原地复用**
+ *          那块记录体空间，不必做页内整理（记录定长、从不搬移）。
+ *          老版本把删除记成 `-1`、丢掉了偏移：这种槽位仍被正确识别为「已删除」，
+ *          只是没法复用记录体（插入时会重新分配空间）。因此**不需要升级文件 magic**，
+ *          旧数据文件照常能打开。
+ */
+inline bool slot_is_deleted(int32_t slot_value) { return slot_value < 0; }
+
+/// 已删除槽位里是否还留着可复用的记录体偏移（旧格式的 -1 没有）
+inline bool slot_has_reusable_offset(int32_t slot_value)
+{
+  return slot_value <= -static_cast<int32_t>(sizeof(SlottedPageHeader));
+}
+
+/// 已删除槽位里保存的「原记录体偏移」
+inline int32_t slot_deleted_offset(int32_t slot_value) { return -slot_value; }
+
 /// 新页或整页被删除后的初始状态
 inline void init_slotted_page(char *page)
 {
@@ -88,8 +108,12 @@ inline bool check_slotted_page(const char *page)
 inline SlotNum find_free_slot(const char *page)
 {
   const SlottedPageHeader *header = page_header_of(page);
+  /// 没删除过的页直接跳过整个槽位扫描：满页插入是常态，别每次扫 O(槽位数)
+  if (header->deleted_count <= 0) {
+    return -1;
+  }
   for (SlotNum i = 0; i < header->record_count; ++i) {
-    if (slot_value_at(page, i) == -1) {
+    if (slot_is_deleted(slot_value_at(page, i))) {
       return i;
     }
   }
