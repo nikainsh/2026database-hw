@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Build and run the deterministic B+Tree separator reproducer.
+# Shell scripts must use LF line endings (see .gitattributes).
 # While the bug exists this script intentionally exits 1 after printing the
 # separator mismatch. It is not part of the default build.sh test suite.
 set -e
