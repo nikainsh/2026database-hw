@@ -58,7 +58,8 @@
   DEFINE_RC(FILE_CREATE)                \
   DEFINE_RC(FILE_OPEN)                  \
   DEFINE_RC(FILE_REMOVE)                \
-  DEFINE_RC(UNSUPPORTED)
+  DEFINE_RC(UNSUPPORTED)                \
+  DEFINE_RC(NUMERIC_OVERFLOW)
 
 enum class RC
 {

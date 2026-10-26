@@ -3,6 +3,7 @@
 #include "sql/expr/expression.h"
 
 #include <sstream>
+#include <limits>
 
 #include "common/log.h"
 #include "common/string_util.h"
@@ -445,7 +446,6 @@ RC AggregateState::accumulate(const Tuple &tuple)
     return rc;
   }
 
-  ++count_;
   switch (func_) {
     case AggFunc::COUNT: break;
     case AggFunc::SUM: {
@@ -457,7 +457,15 @@ RC AggregateState::accumulate(const Tuple &tuple)
       if (result_type_ == AttrType::FLOAT) {
         real_sum_ += staged.get_float();
       } else {
-        int_sum_ += staged.type() == AttrType::FLOAT ? static_cast<int64_t>(staged.get_float()) : staged.get_int64();
+        const int64_t addend = staged.get_int64();
+        // Check before adding: signed overflow itself is undefined behavior.
+        // The guarded subtractions stay representable, including addend=MIN.
+        if ((addend > 0 && int_sum_ > std::numeric_limits<int64_t>::max() - addend) ||
+            (addend < 0 && int_sum_ < std::numeric_limits<int64_t>::min() - addend)) {
+          LOG_WARN("integer SUM exceeds BIGINT range. aggregate=%s", name_.c_str());
+          return RC::NUMERIC_OVERFLOW;
+        }
+        int_sum_ += addend;
       }
       break;
     }
@@ -490,6 +498,7 @@ RC AggregateState::accumulate(const Tuple &tuple)
     }
     default: return RC::UNSUPPORTED;
   }
+  ++count_; // Commit this row only after successful accumulation.
   return RC::SUCCESS;
 }
 

@@ -26,6 +26,7 @@ public:
   explicit RowSource(Rows rows, int table = 0) : rows_(std::move(rows)), table_(table) {}
   int opens = 0, closes = 0;
   bool active = false;
+  void replace_rows(Rows rows) { CHECK(!active); rows_ = std::move(rows); }
   RC read_error = RC::SUCCESS;
   RC close_error = RC::SUCCESS;
   PhysicalOperatorKind kind() const override { return PhysicalOperatorKind::STRING_LIST; }
@@ -200,6 +201,61 @@ static void test_scalar()
   CHECK(std::fabs(writer.rows[0][2].get_float() - 0.5f) < 0.00001f);
 }
 
+static void test_integer_sum_limits()
+{
+  const int64_t high = std::numeric_limits<int64_t>::max();
+  const int64_t low = std::numeric_limits<int64_t>::min();
+  RefValue column(0, AttrType::BIGINT);
+  auto tuple = [](int64_t n) { Tuple row; row.append(Value(n), ColumnRef(0,0)); return row; };
+  const std::vector<std::pair<std::vector<int64_t>,int64_t>> valid{
+      {{high},high}, {{low},low}, {{high-1,1},high}, {{low+1,-1},low},
+      {{high,low},-1}, {{low,high},-1}, {{high,0},high}, {{low,0},low}};
+  for (const auto &test : valid) {
+    AggregateState sum; CHECK(sum.init(AggFunc::SUM,&column,"limits") == RC::SUCCESS);
+    for (int64_t n : test.first) CHECK(sum.accumulate(tuple(n)) == RC::SUCCESS);
+    Value result; CHECK(sum.result(result) == RC::SUCCESS);
+    CHECK(result.type() == AttrType::BIGINT && result.get_int64() == test.second);
+  }
+  for (bool negative : {false,true}) {
+    AggregateState sum; CHECK(sum.init(AggFunc::SUM,&column,"limits") == RC::SUCCESS);
+    CHECK(sum.accumulate(tuple(negative ? low : high)) == RC::SUCCESS);
+    CHECK(sum.accumulate(tuple(negative ? -1 : 1)) == RC::NUMERIC_OVERFLOW);
+    Value result; CHECK(sum.result(result) == RC::SUCCESS && result.get_int64() == (negative ? low : high));
+    CHECK(sum.accumulate(tuple(negative ? 1 : -1)) == RC::SUCCESS);
+    CHECK(sum.result(result) == RC::SUCCESS && result.get_int64() == (negative ? low+1 : high-1));
+  }
+  RefValue integer(0, AttrType::INT);
+  AggregateState promoted; CHECK(promoted.init(AggFunc::SUM,&integer,"int_sum") == RC::SUCCESS);
+  Tuple max_int; max_int.append(Value(std::numeric_limits<int32_t>::max()),ColumnRef(0,0));
+  CHECK(promoted.accumulate(max_int) == RC::SUCCESS && promoted.accumulate(max_int) == RC::SUCCESS);
+  Value total; CHECK(promoted.result(total) == RC::SUCCESS && total.get_int64() == 4294967294LL);
+
+  const std::vector<std::vector<int64_t>> overflow{{high,1},{low,-1},{1,high},{-1,low},{high,high},{low,low}};
+  for (bool grouped : {false,true}) for (const auto &values : overflow) for (bool close_fails : {false,true}) {
+    RefValue group(0,AttrType::INT);
+    AggregateExpression sum(AggFunc::SUM,std::make_unique<RefValue>(1,AttrType::BIGINT));
+    std::unique_ptr<PhysicalOperator> plan;
+    if (grouped) plan = std::make_unique<HashGroupByOperator>(std::vector<Expression *>{&group,&sum},std::vector<Expression *>{&group});
+    else plan = std::make_unique<ScalarGroupByOperator>(std::vector<Expression *>{&sum});
+    Rows input;
+    if (grouped) input.push_back({Value(0),Value(int64_t(0))}); // A prior valid group must not leak partial output.
+    for (int64_t n : values) input.push_back({Value(1),Value(n)});
+    auto source = std::make_unique<RowSource>(input); auto *leaf = source.get();
+    if (close_fails) leaf->close_error = RC::IOERR_CLOSE;
+    plan->add_child(std::move(source));
+    QueryEngine engine(nullptr); engine.set_profile_enabled(true); Capture out;
+    CHECK(run(*plan,out,engine) == RC::NUMERIC_OVERFLOW);
+    CHECK(out.rows.empty() && out.summary.code == RC::NUMERIC_OVERFLOW);
+    CHECK(!leaf->active && leaf->closes == 1 && leaf->statistics().close_calls == 1);
+    CHECK(plan->statistics().errors == 1 && plan->close() == RC::SUCCESS && leaf->closes == 1);
+    leaf->close_error = RC::SUCCESS;
+    leaf->replace_rows(Rows{{Value(1),Value(high)},{Value(1),Value(low)}});
+    CHECK(run(*plan,out,engine) == RC::SUCCESS && out.rows.size() == 1);
+    CHECK(out.rows[0][grouped ? 1 : 0].get_int64() == -1);
+    CHECK(!leaf->active && leaf->opens == 2 && leaf->closes == 2);
+  }
+}
+
 static void test_group_keys()
 {
   QueryEngine engine(nullptr);
@@ -359,6 +415,31 @@ static void test_real_sql()
   SqlResult error;
   CHECK(engine.execute("select * from absent_table", writer, error) == RC::SCHEMA_TABLE_NOT_EXIST);
   CHECK(engine.last_profile().empty()); // No stale previous profile on compilation failure.
+
+  sql("drop table if exists profile_sum_limits");
+  sql("create table profile_sum_limits (g int, v bigint)");
+  for (bool negative : {false,true}) {
+    sql("delete from profile_sum_limits");
+    sql(negative ? "insert into profile_sum_limits values (0,0),(1,-9223372036854775807),(1,-1),(1,-1)"
+                 : "insert into profile_sum_limits values (0,0),(1,9223372036854775807),(1,1)");
+    for (const char *text : {"select sum(v) from profile_sum_limits", "select g,sum(v) from profile_sum_limits group by g"}) {
+      writer.rows.clear(); SqlResult result;
+      CHECK(engine.execute(text,writer,result) == RC::NUMERIC_OVERFLOW);
+      CHECK(writer.summary.code == RC::NUMERIC_OVERFLOW && writer.rows.empty());
+      CHECK(engine.last_profile().find("errors=1") != std::string::npos);
+    }
+  }
+  sql("delete from profile_sum_limits"); // Must not deadlock: failed aggregate scans have been closed.
+  sql("insert into profile_sum_limits values (1,9223372036854775806),(1,1),(2,-9223372036854775807),(2,-1)");
+  sql("select g,sum(v) from profile_sum_limits group by g");
+  CHECK(writer.rows.size() == 2);
+  for (const auto &row : writer.rows) {
+    CHECK(row[0].get_int32() == 1 || row[0].get_int32() == 2);
+    CHECK(row[1].type() == AttrType::BIGINT);
+    CHECK(row[1].get_int64() == (row[0].get_int32() == 1 ? std::numeric_limits<int64_t>::max() : std::numeric_limits<int64_t>::min()));
+  }
+  sql("select sum(v) from profile_sum_limits");
+  CHECK(writer.rows.size() == 1 && writer.rows[0][0].get_int64() == -1);
   CHECK(db->close() == RC::SUCCESS);
 }
 
@@ -369,6 +450,7 @@ int main(int argc, char **argv)
   } else {
     test_filter_project();
     test_scalar();
+    test_integer_sum_limits();
     test_group_keys();
     test_aggregate_failure_cleanup();
     test_join_statistics();
