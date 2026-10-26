@@ -263,3 +263,66 @@ tests/test_frame_wakeup_stress.cpp
 ```
 
 它在 1 帧的池中循环预取、读取、释放和复用页；如果唤醒丢失，测试会在看门狗超时后失败而不是永久挂住。
+
+---
+
+## 13. 原子 checkpoint 与崩溃恢复矩阵
+
+### 13.1 原子 checkpoint
+
+旧实现的 `PageWAL::checkpoint()` 直接用 `fopen("w+b")` 原地截断 WAL。  
+如果进程在截断后、header 写回前崩溃，磁盘上会留下零长度或半个 header 的 WAL，即使数据页已经 fsync，下一次打开也会失败。
+
+v3 改为：
+
+1. 在 WAL 同目录创建 `<wal>.tmp`；
+2. 写入合法 WAL header 并 fsync；
+3. 关闭旧 WAL；
+4. 原子替换原 WAL 文件；
+5. 重新打开新 WAL；
+6. 启动时删除可能残留的 `.wal.tmp`。
+
+这样崩溃后只会看到两种状态：
+
+- 旧 WAL 完整，可以正常重放；
+- 新空 WAL 完整，数据页已经 fsync，可以正常打开。
+
+### 13.2 可注入的崩溃点
+
+测试专用环境变量：
+
+```text
+MINIDB_CRASH_POINT=<point>
+```
+
+设置后，进程会在对应位置直接 `_Exit(99)`，不执行析构，模拟掉电。正常运行时变量缺失，钩子是 no-op。
+
+覆盖的崩溃点：
+
+```text
+before_single_page_write        WAL 已 fsync，单页数据还没写
+after_single_page_write         单页数据已写，还没 checkpoint
+before_wal_checkpoint           数据已 fsync，checkpoint 还没开始
+before_checkpoint_replace       临时 WAL 已写完，还没替换旧 WAL
+after_checkpoint_replace        新 WAL 已替换，还没重新打开
+before_two_page_write           两页 WAL 已 fsync，数据页还没写
+after_first_page_write          两页操作只写了第一页
+after_two_page_write            两页都写完，还没 checkpoint
+```
+
+### 13.3 回归测试
+
+```text
+tests/test_crash_consistency.cpp
+```
+
+测试通过父子进程模式在 9 个崩溃点退出，然后重新打开数据文件，验证：
+
+- 打开不失败；
+- WAL 能重放或已经安全 checkpoint；
+- 页内容正确；
+- `page_count` / `free_page_count` / free list 一致；
+- 分配页清零、释放页可复用；
+- 不残留 `.wal.tmp`。
+
+这组测试覆盖“崩溃一致性”，不等价于“介质完整性”：doublewrite / 数据页 checksum 仍作为后续工作，见第 7 节。

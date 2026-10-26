@@ -302,6 +302,7 @@ pool->checkpoint();            // 同上
   5. fsync 数据文件；
   6. checkpoint 截断 WAL。
 - `close` 内部会调用 flush/checkpoint；失败时不会清空 frame manager 或关闭文件，可以修复 I/O 后重试。
+- `checkpoint` 通过同目录临时文件 + 原子替换完成，不会留下半写 WAL header；启动时会清理残留的 `.wal.tmp`。
 - `allocate_page` / `dispose_page` 把 header 和对应数据页作为**一条两页 WAL record** 写入，恢复时两页一起重放。
 
 WAL 文件：
