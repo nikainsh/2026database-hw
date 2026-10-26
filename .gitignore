@@ -6,6 +6,7 @@ _test_wal/
 _test_record/
 _test_index/
 _test_db/
+_test_consistency/
 e2e_data/
 data/
 *.o
