@@ -151,7 +151,7 @@ static void correctness() {
 static void errors_and_budget() {
   const Keys keys{{{0,0},{1,0},AttrType::INT}, {{0,1},{1,1},AttrType::CHARS}};
   const Rows one{{Value(1),Value("abc")}};
-  for (const Keys invalid : {Keys{}, Keys{{{0,0},{1,0},AttrType::INT},{{0,-1},{1,1},AttrType::CHARS}}}) {
+  for (const Keys &invalid : {Keys{}, Keys{{{0,0},{1,0},AttrType::INT},{{0,-1},{1,1},AttrType::CHARS}}}) {
     HashJoinOperator join(invalid); Source *l, *r; children(join, one, one, l, r);
     CHECK(join.open() == RC::INVALID_ARGUMENT && l->opens == 0 && r->opens == 0);
   }
