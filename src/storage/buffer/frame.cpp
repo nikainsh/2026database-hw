@@ -1,4 +1,4 @@
-/* database26 buffer manager - page frame and page table */
+/* database26 buffer manager - page frame */
 #include "storage/buffer/frame.h"
 
 void Frame::init(FrameId frame_id)
@@ -52,15 +52,3 @@ void Frame::reset_access()
   access_seq_[0] = 0;
   access_seq_[1] = 0;
 }
-
-bool PageTable::get(FrameId *frame_id, PageNum page_id) const
-{
-  auto iter = map_.find(page_id);
-  if (iter == map_.end()) {
-    return false;
-  }
-  *frame_id = iter->second;
-  return true;
-}
-
-bool PageTable::erase(PageNum page_id) { return map_.erase(page_id) > 0; }

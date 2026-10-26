@@ -46,6 +46,7 @@ DiskBufferPoolManager
 DiskBufferPool::meta_mutex_
   -> FrameManager::mutex_
       -> DiskBufferPool::flush_mutex_
+          -> DiskBufferPool::io_mutex_
           -> PageWAL::mutex_
 
 Frame latch 在拿到 frame_id 之后单独获取，不和上面几把锁同时持有。
@@ -54,6 +55,7 @@ Frame latch 在拿到 frame_id 之后单独获取，不和上面几把锁同时�
 - `meta_mutex_` 保护文件 header、free list、closing 状态。
 - `FrameManager::mutex_` 保护全局页表、frame 元数据、owner 配额、LRU-K。
 - `flush_mutex_` 串行化“WAL append + 数据页写”和 checkpoint，避免 checkpoint 在 append 与 data write 之间截断 WAL。
+- `io_mutex_` 串行化数据文件上的 seek/read/write/sync。异步预取不持 `meta_mutex_`，因此不能只靠文件级元数据锁保护 `FILE*` 偏移。
 - 页 miss 会先在全局页表中插入 `loading` frame，然后释放 `FrameManager::mutex_` 做磁盘读；
 - 同一页的并发 miss 通过条件变量等待，只发一次 I/O；
 - 不同文件可以并行缺页；同一个 `DiskBufferPool` 的 `get_page` 仍持 `meta_mutex_`，因此单文件内缺页串行。
@@ -82,6 +84,7 @@ Frame latch 在拿到 frame_id 之后单独获取，不和上面几把锁同时�
 - 预取 worker 是单线程；预取是 best-effort，不保证调用返回时页已驻留。
 - 后台刷脏每 50ms 最多处理 4 页，不做后台 checkpoint，也没有 group commit。
 - WAL 仍是页级 full-page redo；尚未启用 doublewrite / 数据页 checksum。
+- 所有数据文件 I/O 都经过 `io_mutex_`；异步预取可以与前台读写、后台刷脏并发，但不会互相踩 `FILE*` 偏移。
 - `flush_page` / `flush_all_buffers` 会与页写入串行化；调用方不应在另一个线程同时 `close` 同一个 pool。
 
 ---
@@ -156,12 +159,12 @@ v3 改为：
 bash bench/run_bench.sh
 ```
 
-本机基线（MinGW g++ 14.2，512 页，64 帧）：
+本机近期基线（MinGW g++ 14.2，512 页，64 帧；单线程，受磁盘缓存影响）：
 
 ```text
-random_read:   ops=20000 time=147.9 ms throughput=135248 ops/s
-sequential:    ops=5120  time=33.7 ms  throughput=151888 ops/s
-mixed_80_20:   ops=5000  time=459.1 ms throughput=10892 ops/s
+random_read:   ops=20000 time=176.2 ms throughput=113534 ops/s
+sequential:    ops=5120  time=38.8 ms  throughput=132030 ops/s
+mixed_80_20:   ops=5000  time=436.0 ms throughput=11469 ops/s
 ```
 
 混合写吞吐明显低于读，主要因为当前 WAL 每次写页都 fsync。后续如果要优化写路径，可以做 group commit / 批量 fsync。
@@ -224,3 +227,39 @@ RC append_two_pages_and_sync(PageNum page_a, const char *data_a,
 - 单页 record 的格式保持不变，旧 WAL 仍可回放。
 
 回归测试覆盖两页 record 的正常回放和“第二页损坏时整条 record 不生效”。
+
+---
+
+## 12. 数据文件 I/O 与帧唤醒的并发收尾
+
+### 12.1 数据文件 I/O 串行化
+
+异步预取由 `FrameManager` 的 worker 执行，不持有 `DiskBufferPool::meta_mutex_`。  
+如果它和前台 `get_page_*` 或后台刷脏同时操作同一个 `FILE*`，`seek` 与 `fread/fwrite` 之间可能交错，导致把错误的页读进缓存。
+
+v3 增加 `DiskBufferPool::io_mutex_`：
+
+- `read_page_raw` / `write_page_raw` / `sync_data_file` 都在该锁下执行；
+- 两页分配/释放的 header+data 写入整段持有该锁，运行中的读者不会看到 header 已更新而数据页尚未更新的中间状态；
+- 页 latch 仍然只保护页内容，不和 I/O 锁混用。
+
+回归测试：
+
+```text
+tests/test_buffer_io_race.cpp
+```
+
+它在 8 帧的只读池上同时运行多个前台读者和预取线程，校验每次读到的页内容都属于正确页号。
+
+### 12.2 唤醒不能丢失
+
+`FrameManager::unpin()` 现在在 `FrameManager::mutex_` 下更新 pin/background pin 并通知等待者。  
+`acquire()` 等待 `loading`/后台临时 pin、`remove_page()` 等待后台 pin 时都使用谓词等待，避免“检查条件后、进入 wait 前”丢失 `notify` 导致挂起。
+
+回归测试：
+
+```text
+tests/test_frame_wakeup_stress.cpp
+```
+
+它在 1 帧的池中循环预取、读取、释放和复用页；如果唤醒丢失，测试会在看门狗超时后失败而不是永久挂住。

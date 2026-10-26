@@ -1,10 +1,9 @@
-/* database26 buffer manager - page frame and page table */
+/* database26 buffer manager - page frame */
 #pragma once
 
 #include <atomic>
 #include <cstdint>
 #include <shared_mutex>
-#include <unordered_map>
 
 #include "common/types.h"
 #include "storage/buffer/page.h"
@@ -15,8 +14,9 @@ class DiskBufferPool;
  * @brief One in-memory page frame.
  *
  * Thread-safety contract:
- *   - pin_count_ and dirty_ are atomic.
- *   - page_id_, owner_, access history are protected by DiskBufferPool::meta_mutex_.
+ *   - pin_count_, background_pin_count_ and dirty_ are atomic.
+ *   - page_id_, owner_, loading_ and access history are protected by
+ *     FrameManager::mutex_.
  *   - latch_ protects the 8KB page bytes. Readers take a shared lock, writers an
  *     exclusive lock. A PageHandle holds the latch until reset/destruction.
  */
@@ -63,7 +63,7 @@ public:
 
   std::shared_mutex &latch() { return latch_; }
 
-  /// Access history is only touched under DiskBufferPool::meta_mutex_.
+  /// Access history is only touched under FrameManager::mutex_.
   void record_access(uint64_t sequence);
   int  access_count() const { return access_count_; }
   uint64_t access_seq(int index) const;
@@ -82,21 +82,4 @@ private:
 
   uint64_t access_seq_[kAccessHistory] = {0, 0};
   int      access_count_               = 0;
-};
-
-/// page_num -> frame_id map. It is not internally synchronized; DiskBufferPool
-/// protects it with meta_mutex_.
-class PageTable
-{
-public:
-  void insert(PageNum page_id, FrameId frame_id) { map_[page_id] = frame_id; }
-  bool get(FrameId *frame_id, PageNum page_id) const;
-  bool erase(PageNum page_id);
-  bool contains(PageNum page_id) const { return map_.count(page_id) > 0; }
-  void clear() { map_.clear(); }
-  void reserve(size_t n) { map_.reserve(n); }
-  size_t size() const { return map_.size(); }
-
-private:
-  std::unordered_map<PageNum, FrameId> map_;
 };

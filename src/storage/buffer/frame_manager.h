@@ -21,10 +21,9 @@ class DiskBufferPool;
 /**
  * @brief Global frame pool shared by all open buffer pools.
  *
- * Phase 1: correctness first. A page miss keeps the manager mutex while reading
- * the page from disk, so different files do not fault in parallel yet. The
- * global page table and LRU-K victim selection are already global, which is the
- * important step beyond v2's per-file frame arrays.
+ * Page misses use per-page in-flight I/O: the manager inserts a loading frame,
+ * releases this mutex for the disk read, and lets other files fault in parallel.
+ * The global page table and LRU-K victim selection are shared by all files.
  */
 class FrameManager
 {

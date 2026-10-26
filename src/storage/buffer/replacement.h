@@ -21,7 +21,7 @@ class LruKPolicy
 public:
   explicit LruKPolicy(int k = 2);
 
-  /// Must be called under DiskBufferPool::meta_mutex_.
+  /// Must be called under FrameManager::mutex_.
   void on_access(Frame &frame);
 
   /// Must be called under the frame manager lock.
