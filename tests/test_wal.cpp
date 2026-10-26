@@ -69,6 +69,7 @@ static void test_append_replay_checkpoint()
     check_page(restored[2].data(), 2);
     assert(OB_SUCC(wal.checkpoint()));
     assert(file_size(kWal) == 16);
+    assert(!file_exist(kWal + ".tmp"));
     assert(OB_SUCC(wal.close()));
   }
 }

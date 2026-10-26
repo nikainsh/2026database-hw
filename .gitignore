@@ -16,3 +16,5 @@ data/
 _bench/
 bench/bench_buffer_pool
 bench/bench_buffer_pool.exe
+_test_index_stats/
+_test_crash/
