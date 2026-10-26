@@ -186,6 +186,11 @@ private:
   RC locate_entry(PageNum leaf, const char *key, const char *value, PageNum *found_page, int32_t *found_slot);
   RC find_path(PageNum page, PageNum target_leaf, std::vector<PathStep> &path);
   RC erase_from_leaf(PageNum page, int32_t slot, int32_t *num_key_after);
+  /// 读一个叶子里第 0 个键（即该叶子的最小键）
+  RC leaf_first_key(PageNum page, std::string &key) const;
+  /// 叶子最小键变了：沿路径自底向上把祖先里指向这棵子树的分隔键改成新最小键。
+  /// 若这一层是 child[0]（子树本身没有分隔键），变化继续往上传，直到某一层 child_index>0。
+  RC replace_separator_upward(const std::vector<PathStep> &path, const std::string &min_key);
   RC fix_underflow(PageNum parent, int32_t child_index, DeleteInfo *parent_info);
   RC move_key_to_left(PageNum parent, int32_t child_index);
   RC move_key_to_right(PageNum parent, int32_t child_index);

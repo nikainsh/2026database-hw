@@ -782,6 +782,22 @@ RC BplusTree::delete_entry(const char *key, const RID &rid)
     return rc;
   }
 
+  /// 3.5) 删掉的是叶子最小键、且没有触发下溢时，父节点的分隔键必须同步改成新的最小键：
+  ///      key[i] 的定义是「child[i+1] 子树的最小键」，不更新就会留下一个偏小的分隔键，
+  ///      后续 find_leaf 会走错分支，validate() 也会报 separator mismatch。
+  ///      这里必须在再平衡之前做 —— 合并/借位之后原叶子可能已经被释放。
+  if (target_slot == 0 && num_key_after > 0 && !path.empty()) {
+    std::string new_min;
+    rc = leaf_first_key(target_page, new_min);
+    if (OB_FAIL(rc)) {
+      return rc;
+    }
+    rc = replace_separator_upward(path, new_min);
+    if (OB_FAIL(rc)) {
+      return rc;
+    }
+  }
+
   /// 4) 自底向上修复低于最小填充度的节点
   bool underflow = num_key_after < header_.min_keys;
   for (int32_t i = static_cast<int32_t>(path.size()) - 1; i >= 0 && underflow; --i) {
@@ -923,6 +939,55 @@ RC BplusTree::erase_from_leaf(PageNum page, int32_t slot, int32_t *num_key_after
   header->num_key -= 1;
   *num_key_after = header->num_key;
   return handle.mark_dirty();
+}
+
+RC BplusTree::leaf_first_key(PageNum page, std::string &key) const
+{
+  PageHandle handle;
+  RC         rc = buffer_pool_->get_page_read(page, handle);
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+  const char *node = handle.const_data();
+  if (!is_leaf_page(node) || node_key_count(node) <= 0) {
+    LOG_ERROR("leaf has no key while reading new minimum. file=%s, page=%d", file_name_.c_str(), page);
+    return RC::INTERNAL;
+  }
+  key.assign(leaf_key_at(node, 0), static_cast<size_t>(header_.key_len));
+  return RC::SUCCESS;
+}
+
+RC BplusTree::replace_separator_upward(const std::vector<PathStep> &path, const std::string &min_key)
+{
+  for (int32_t i = static_cast<int32_t>(path.size()) - 1; i >= 0; --i) {
+    const PathStep &step = path[static_cast<size_t>(i)];
+
+    /// 这一层是 child[0]：它本身没有分隔键，但整棵子树的最小键变了，
+    /// 变化继续往上传，直到某一层 child_index > 0 才是真正要改的那个分隔键。
+    if (step.child_index == 0) {
+      continue;
+    }
+
+    PageHandle handle;
+    RC         rc = buffer_pool_->get_page_write(step.page, handle);
+    if (OB_FAIL(rc)) {
+      return rc;
+    }
+
+    char    *node  = handle.value();
+    const int32_t count = node_key_count(node);
+    const int32_t slot  = step.child_index - 1;
+    if (slot < 0 || slot >= count) {
+      LOG_ERROR("separator slot out of range. file=%s, page=%d, slot=%d, keys=%d",
+                file_name_.c_str(), step.page, slot, count);
+      return RC::INTERNAL;
+    }
+    memcpy(internal_key_at(node, slot), min_key.data(), static_cast<size_t>(header_.key_len));
+    return handle.mark_dirty();
+  }
+
+  /// 一路都是最左子树：变的是整棵树的最小键，根节点没有分隔键需要改
+  return RC::SUCCESS;
 }
 
 RC BplusTree::fix_underflow(PageNum parent, int32_t child_index, DeleteInfo *parent_info)
