@@ -51,7 +51,8 @@ public:
                                PageNum page_b, const char *data_b);
 
   /// Truncate the WAL. Caller must have fsync'ed the data file first.
-  RC checkpoint();
+  /// crash_points is a test hook used by crash-consistency tests only.
+  RC checkpoint(bool crash_points = false);
 
   uint64_t last_lsn() const { return last_lsn_; }
   bool     is_open() const { return file_ != nullptr; }

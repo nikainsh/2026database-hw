@@ -8,6 +8,7 @@
 #include <limits>
 #include <system_error>
 
+#include "common/fault_inject.h"
 #include "common/log.h"
 #include "storage/buffer/checksum.h"
 
@@ -526,9 +527,11 @@ RC DiskBufferPool::write_page_with_wal(PageNum page_num, const char *data)
     stats_.wal_syncs.fetch_add(1, std::memory_order_relaxed);
   }
 
+  fault_inject_point("before_single_page_write");
   RC rc = write_page_raw(page_num, data);
   if (OB_SUCC(rc)) {
     stats_.writes.fetch_add(1, std::memory_order_relaxed);
+    fault_inject_point("after_single_page_write");
   }
   return rc;
 }
@@ -555,15 +558,18 @@ RC DiskBufferPool::write_two_pages_with_wal(PageNum page_a, const char *data_a,
   /// not observe the new header before the corresponding data page is zeroed
   /// or linked into the free list.
   std::lock_guard<std::mutex> io_guard(io_mutex_);
+  fault_inject_point("before_two_page_write");
   RC rc = write_page_raw_locked(page_a, data_a);
   if (OB_FAIL(rc)) {
     return rc;
   }
+  fault_inject_point("after_first_page_write");
   rc = write_page_raw_locked(page_b, data_b);
   if (OB_FAIL(rc)) {
     return rc;
   }
   stats_.writes.fetch_add(2, std::memory_order_relaxed);
+  fault_inject_point("after_two_page_write");
   return RC::SUCCESS;
 }
 
@@ -790,7 +796,8 @@ RC DiskBufferPool::flush_all_buffers()
     std::lock_guard<std::mutex> flush_guard(flush_mutex_);
     rc = sync_data_file();
     if (OB_SUCC(rc) && wal_) {
-      rc = wal_->checkpoint();
+      fault_inject_point("before_wal_checkpoint");
+      rc = wal_->checkpoint(true);
       if (OB_SUCC(rc)) {
         stats_.checkpoints.fetch_add(1, std::memory_order_relaxed);
       }

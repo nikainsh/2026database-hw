@@ -1,16 +1,19 @@
 /* database26 buffer manager - page-level write-ahead log */
 #include "storage/buffer/page_wal.h"
 
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <vector>
 
+#include "common/fault_inject.h"
 #include "storage/buffer/checksum.h"
 #include "storage/buffer/page.h"
 
 #ifdef _WIN32
 #include <io.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -79,6 +82,49 @@ RC sync_file(FILE *fp)
 #endif
   return RC::SUCCESS;
 }
+
+RC write_wal_header(FILE *fp)
+{
+  WALHeader header;
+  header.header_size = sizeof(WALHeader);
+  if (file_seek(fp, 0) != 0) {
+    return RC::IOERR_SEEK;
+  }
+  if (fwrite(&header, 1, sizeof(header), fp) != sizeof(header)) {
+    return RC::IOERR_WRITE;
+  }
+  return sync_file(fp);
+}
+
+bool atomic_replace(const std::string &from, const std::string &to)
+{
+  /// std::filesystem::rename replaces an existing target on the supported
+  /// platforms (MoveFileEx/rename semantics); keeping both paths in the same
+  /// directory makes the replacement atomic from the reader's perspective.
+  std::error_code ec;
+  std::filesystem::rename(from, to, ec);
+  return !ec;
+}
+
+RC sync_parent_directory(const std::string &path)
+{
+#ifdef _WIN32
+  (void)path;
+  return RC::SUCCESS;
+#else
+  std::filesystem::path parent = std::filesystem::path(path).parent_path();
+  if (parent.empty()) {
+    parent = ".";
+  }
+  const int fd = open(parent.c_str(), O_RDONLY);
+  if (fd < 0) {
+    return RC::IOERR_SYNC;
+  }
+  const int rc = fsync(fd);
+  close(fd);
+  return rc == 0 ? RC::SUCCESS : RC::IOERR_SYNC;
+#endif
+}
 }  // namespace
 
 PageWAL::PageWAL(std::string path) : path_(std::move(path)) {}
@@ -96,6 +142,12 @@ RC PageWAL::open(bool create_if_missing)
   if (!exists && !create_if_missing) {
     return RC::FILE_NOT_EXIST;
   }
+
+  /// A crash between writing the checkpoint temp file and replacing the old
+  /// WAL leaves a stale temp file behind. The old WAL (or the new one after a
+  /// successful replace) is always the source of truth.
+  std::error_code temp_ec;
+  std::filesystem::remove(path_ + ".tmp", temp_ec);
 
   file_ = fopen(path_.c_str(), exists ? "r+b" : "w+b");
   if (file_ == nullptr) {
@@ -139,18 +191,7 @@ RC PageWAL::close()
   return RC::SUCCESS;
 }
 
-RC PageWAL::write_header_locked()
-{
-  WALHeader header;
-  header.header_size = sizeof(WALHeader);
-  if (file_seek(file_, 0) != 0) {
-    return RC::IOERR_SEEK;
-  }
-  if (fwrite(&header, 1, sizeof(header), file_) != sizeof(header)) {
-    return RC::IOERR_WRITE;
-  }
-  return sync_file(file_);
-}
+RC PageWAL::write_header_locked() { return write_wal_header(file_); }
 
 RC PageWAL::read_header_locked()
 {
@@ -331,17 +372,67 @@ RC PageWAL::append_two_pages_and_sync(PageNum page_a, const char *data_a,
   return rc;
 }
 
-RC PageWAL::checkpoint()
+RC PageWAL::checkpoint(bool crash_points)
 {
   std::lock_guard<std::mutex> guard(mutex_);
   if (file_ == nullptr) {
     return RC::FILE_NOT_OPENED;
   }
 
-  fclose(file_);
-  file_ = fopen(path_.c_str(), "w+b");
+  /// Replace the WAL atomically instead of truncating it in place. A crash
+  /// must leave either the old WAL with all records or a valid empty WAL; a
+  /// zero-length/partially-written header would make the data file unusable
+  /// even though its pages were already fsync'ed.
+  const std::string temp_path = path_ + ".tmp";
+  FILE             *temp_file = fopen(temp_path.c_str(), "wb");
+  if (temp_file == nullptr) {
+    return RC::FILE_OPEN;
+  }
+
+  RC rc = write_wal_header(temp_file);
+  if (fclose(temp_file) != 0 && OB_SUCC(rc)) {
+    rc = RC::IOERR_CLOSE;
+  }
+  if (OB_FAIL(rc)) {
+    std::error_code ec;
+    std::filesystem::remove(temp_path, ec);
+    return rc;
+  }
+
+  if (crash_points) {
+    fault_inject_point("before_checkpoint_replace");
+  }
+
+  if (fclose(file_) != 0) {
+    file_ = fopen(path_.c_str(), "r+b");
+    std::error_code ec;
+    std::filesystem::remove(temp_path, ec);
+    return RC::IOERR_CLOSE;
+  }
+  file_ = nullptr;
+
+  if (!atomic_replace(temp_path, path_)) {
+    /// The old WAL is still in place on failure; reopen it so the caller can
+    /// retry checkpoint after handling the I/O problem.
+    file_ = fopen(path_.c_str(), "r+b");
+    std::error_code ec;
+    std::filesystem::remove(temp_path, ec);
+    return RC::IOERR_WRITE;
+  }
+
+  rc = sync_parent_directory(path_);
+  if (OB_FAIL(rc)) {
+    file_ = fopen(path_.c_str(), "r+b");
+    return rc;
+  }
+
+  if (crash_points) {
+    fault_inject_point("after_checkpoint_replace");
+  }
+
+  file_ = fopen(path_.c_str(), "r+b");
   if (file_ == nullptr) {
     return RC::FILE_OPEN;
   }
-  return write_header_locked();
+  return RC::SUCCESS;
 }
