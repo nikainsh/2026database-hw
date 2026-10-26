@@ -4,6 +4,7 @@
 
 #include <algorithm>
 
+#include "common/log.h"
 #include "storage/record/slotted_page.h"
 
 RC RecordScanner::init(HeapRecordManager *manager)
@@ -45,6 +46,12 @@ RC RecordScanner::next(Record &record)
       RC rc = buffer_pool_->get_page_read(current_page_, handle_);
       if (OB_FAIL(rc)) {
         return rc;
+      }
+      /// 崩溃后可能读到半写页：页头不可信就不要按它的 record_count / 偏移继续走
+      if (!check_slotted_page(handle_.const_data())) {
+        LOG_ERROR("invalid slotted page header. file=%s, page=%d", buffer_pool_->file_name().c_str(), current_page_);
+        handle_.reset();
+        return RC::BUFFERPOOL_CORRUPTED;
       }
       next_slot_ = 0;
     }

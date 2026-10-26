@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <mutex>
+
 #include "common/rc.h"
 #include "storage/buffer/disk_buffer_pool.h"
 #include "storage/record/record.h"
@@ -54,19 +56,28 @@ public:
   DiskBufferPool *buffer_pool() const { return buffer_pool_; }
   const std::string &file_name() const { return file_name_; }
 
-  /// 供扫描器使用：页号是否合法、页头读取
-  RC read_page_header(PageNum page_num, SlottedPageHeader &header);
-
 private:
+  /// 把页 1 的表头读进内存缓存（open 时调用一次）
+  RC load_header();
+  /// 缓存脏了才写回页 1；返回失败时缓存保持脏标记，调用方可重试
+  RC flush_header();
+  /// 缓存访问：不再每次 DML 都真读一次页 1（调用方需持 latch_）
   RC read_header(RecordFileHeader &header);
+  /// 更新缓存并落盘（调用方需持 latch_）
   RC write_header(const RecordFileHeader &header);
-
-  /// 在第 page_num 页里找一个可用槽位；found 为 false 说明这页放不下了
-  RC allocate_slot(PageNum page_num, SlotNum *slot, int32_t *offset, bool *found);
 
 private:
   DiskBufferPool *buffer_pool_ = nullptr;
   std::string     file_name_;
   int             record_size_ = 0;
   bool            opened_      = false;
+
+  /// 表头页（页 1）的内存缓存：open 时读一次，之后每次写操作只写回一次，
+  /// 省掉原先「每次 insert/delete 读一次页头 + 写一次页头」的两趟页访问。
+  RecordFileHeader header_;
+  bool             header_dirty_ = false;
+
+  /// 表级互斥：表头是「读-改-写」的共享状态。并发插入/删除若不串行化，
+  /// 两个线程会各自读到 count=N 再写回 N+1，行数统计永久漂移（丢更新）。
+  mutable std::mutex latch_;
 };
