@@ -1,19 +1,25 @@
-/* minidb - 存储层一致性自测：多索引写失败回滚、建索引失败收尾、超大 record_size */
+/* minidb - 存储层一致性与健壮性自测：索引回滚、建索引收尾、并发计数、损坏页、记录大小上限 */
 /*
- * 这个测试盯的是「表级写操作要么全成、要么全不成」这条语义：
+ * 这个测试盯的是存储层的几条硬约定：
  *   1) INSERT 时第 2 个唯一索引冲突，第 1 个索引里已经写进去的项必须被撤回，
  *      否则会留下指向不存在记录的悬挂索引项（之后索引扫描取记录会直接报错）。
  *   2) UPDATE 改了多个被索引列，后一个索引冲突时，前面索引改动也必须撤回。
  *   3) 在有重复值的列上建 UNIQUE 索引失败后，索引文件/元数据/缓冲池都要干净，
  *      同名索引还能重新建成功。
  *   4) record_size 超过一页容量时必须在 open() 就报错（否则 insert 会无限扩文件）。
+ *   5) 多线程同时插入同一张表，表头行数不能丢更新（扫描行数 == record_count == 总数）。
+ *   6) 页头被读坏时（崩溃后的半写页）必须返回错误码，而不是按坏偏移越界写/越界读。
  */
 
+#include <atomic>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <set>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/file_util.h"
@@ -303,6 +309,132 @@ static void test_record_size_limit()
   assert(OB_SUCC(bpm.close()));
 }
 
+// ---------------------------------------------------------------------------
+// 5) 并发插入：表头行数不能丢更新
+// ---------------------------------------------------------------------------
+static void test_concurrent_insert()
+{
+  const int         kRecordSize = 16;
+  const std::string heap_path   = path_join(kDbDir, "concurrent.heap");
+
+  DiskBufferPoolManager bpm(64);
+  assert(OB_SUCC(bpm.create_file(heap_path)));
+
+  DiskBufferPool *pool = nullptr;
+  assert(OB_SUCC(bpm.open_file(heap_path, ReadWriteMode::READ_WRITE, &pool)));
+
+  HeapRecordManager manager;
+  assert(OB_SUCC(manager.open(pool, kRecordSize, true)));
+
+  constexpr int kThreads   = 8;
+  constexpr int kPerThread = 500;
+
+  std::atomic<int>         failures{0};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&manager, &failures, t]() {
+      for (int i = 0; i < kPerThread; ++i) {
+        char    data[kRecordSize] = {0};
+        int32_t id                = t * kPerThread + i;
+        memcpy(data, &id, sizeof(id));
+
+        Record record;
+        assert(OB_SUCC(record.copy_data(data, kRecordSize)));
+        if (OB_FAIL(manager.insert_record(record))) {
+          ++failures;
+        }
+      }
+    });
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
+
+  assert(failures.load() == 0);
+
+  int64_t count = 0;
+  assert(OB_SUCC(manager.get_record_count(count)));
+  assert(count == kThreads * kPerThread);  /// 旧实现里并发读改写表头会把这数字写小
+
+  /// 扫描行数必须与表头一致，且 RID 不能重复（槽位没有被两条记录共用）
+  RecordScanner                        scanner;
+  std::set<std::pair<PageNum, SlotNum>> rids;
+  assert(OB_SUCC(scanner.init(&manager)));
+  Record record;
+  while (true) {
+    RC rc = scanner.next(record);
+    if (rc == RC::RECORD_EOF) {
+      break;
+    }
+    assert(OB_SUCC(rc));
+    rids.insert(std::make_pair(record.rid().page_num, record.rid().slot_num));
+  }
+  assert(rids.size() == static_cast<size_t>(kThreads * kPerThread));
+
+  assert(OB_SUCC(bpm.close()));
+
+  /// 重开：行数已经落盘，不能因为缓存没刷而丢
+  DiskBufferPoolManager bpm2(64);
+  DiskBufferPool       *pool2 = nullptr;
+  assert(OB_SUCC(bpm2.open_file(heap_path, ReadWriteMode::READ_WRITE, &pool2)));
+
+  HeapRecordManager reopened;
+  assert(OB_SUCC(reopened.open(pool2, kRecordSize, false)));
+  int64_t reopened_count = 0;
+  assert(OB_SUCC(reopened.get_record_count(reopened_count)));
+  assert(reopened_count == kThreads * kPerThread);
+
+  assert(OB_SUCC(bpm2.close()));
+}
+
+// ---------------------------------------------------------------------------
+// 6) 页头损坏：必须报错，而不是按坏偏移越界写
+// ---------------------------------------------------------------------------
+static void test_corrupted_page_header()
+{
+  const int         kRecordSize = 16;
+  const std::string heap_path   = path_join(kDbDir, "corrupted.heap");
+
+  DiskBufferPoolManager bpm(32);
+  assert(OB_SUCC(bpm.create_file(heap_path)));
+
+  DiskBufferPool *pool = nullptr;
+  assert(OB_SUCC(bpm.open_file(heap_path, ReadWriteMode::READ_WRITE, &pool)));
+
+  HeapRecordManager manager;
+  assert(OB_SUCC(manager.open(pool, kRecordSize, true)));
+
+  char   data[kRecordSize] = {0};
+  Record first;
+  assert(OB_SUCC(first.copy_data(data, kRecordSize)));
+  assert(OB_SUCC(manager.insert_record(first)));
+
+  /// 把第 2 页的页头改成离谱值：模拟崩溃/位翻转留下的半写页
+  {
+    PageHandle handle;
+    assert(OB_SUCC(pool->get_page_write(RECORD_FIRST_DATA_PAGE, handle)));
+    SlottedPageHeader *header = page_header_of(handle.value());
+    header->free_start        = 0x7FFFFFF0;
+    header->record_count      = 1 << 30;
+    assert(OB_SUCC(handle.mark_dirty()));
+  }
+
+  Record next;
+  assert(OB_SUCC(next.copy_data(data, kRecordSize)));
+  assert(manager.insert_record(next) == RC::BUFFERPOOL_CORRUPTED);
+
+  Record probe;
+  assert(manager.get_record(RID(RECORD_FIRST_DATA_PAGE, 0), probe) == RC::BUFFERPOOL_CORRUPTED);
+
+  RecordScanner scanner;
+  assert(OB_SUCC(scanner.init(&manager)));
+  Record scanned;
+  assert(scanner.next(scanned) == RC::BUFFERPOOL_CORRUPTED);
+
+  assert(OB_SUCC(bpm.close()));
+}
+
 static void setup_database(Db **db)
 {
   std::error_code ec;
@@ -337,6 +469,8 @@ int main()
   test_update_rollback(*db, *table);
   test_create_index_rollback(*db);
   test_record_size_limit();
+  test_concurrent_insert();
+  test_corrupted_page_header();
 
   assert(OB_SUCC(db->close()));
   delete db;
