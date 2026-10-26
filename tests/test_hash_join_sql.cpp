@@ -171,10 +171,61 @@ static void indexed_path_and_budget(Fixture &f) {
   f.count(wide, 32, true);
 }
 
+static void composite_keys(Fixture &f) {
+  f.table("hj_class_a", "c int, s int, label char(8)");
+  f.table("hj_class_b", "c int, s int, score int");
+  f.sql("insert into hj_class_a values (1,1,'a'),(1,2,'b'),(1,2,'b2'),(2,1,'c')");
+  f.sql("insert into hj_class_b values (1,1,80),(1,2,90),(1,2,91),(2,1,70),(2,9,99)");
+  const std::string from = " from hj_class_a a,hj_class_b b ";
+  const std::string full = "select count(*)" + from + "where a.c=b.c and a.s=b.s";
+  CHECK(f.plan(full, true).find("key_count=2") != std::string::npos);
+  f.count(full, 6, true);
+  CHECK(f.engine->last_profile().find("candidates=6 build_rows=4 probe_rows=5") != std::string::npos);
+  f.sql("select a.label,b.score" + from + "where a.c=b.c and a.s=b.s");
+  CHECK(bag(f.writer.rows) == bag(Rows{{Value("a"),Value(80)}, {Value("b"),Value(90)},
+      {Value("b"),Value(91)}, {Value("b2"),Value(90)}, {Value("b2"),Value(91)}, {Value("c"),Value(70)}}));
+  const std::string reversed = "select count(*) from hj_class_b b,hj_class_a a where b.s=a.s and a.c=b.c";
+  CHECK(f.plan(reversed, true).find("key_count=2") != std::string::npos);
+  f.count(reversed, 6, true);
+  CHECK(f.plan(full + " and b.c=a.c and b.s=a.s", true).find("key_count=2") != std::string::npos);
+  f.count(full + " and b.c=a.c and b.s=a.s", 6, true); // Do not encode duplicate equalities twice.
+  f.count(full + " and b.score>80 and a.label<>'b2'", 2, true);
+  const std::string disjunction = "select count(*)" + from + "where a.c=b.c and (a.s=b.s or b.s=9)";
+  CHECK(f.plan(disjunction, true).find("key_count=1") != std::string::npos);
+  f.count(disjunction, 7, true); // s equality is NOT mandatory here.
+  f.table("hj_class_empty", "c int, s int");
+  f.count("select count(*) from hj_class_a a,hj_class_empty b where a.c=b.c and a.s=b.s", 0, true);
+  f.count("select count(*) from hj_class_a a,hj_class_a b where a.c=b.c and a.s=b.s", 6, true);
+
+  f.table("hj_mixed_a", "c int, s bigint, n char(16), x float");
+  f.table("hj_mixed_b", "n char(32), s bigint, c int, x float");
+  f.sql("insert into hj_mixed_a values (1,9007199254740992,'x|y',1.0),(1,9007199254740993,'x|y',2.0)");
+  f.sql("insert into hj_mixed_b values ('x|y',9007199254740993,1,2.0),('x|y',9007199254740992,1,9.0)");
+  const std::string mixed = "select count(*) from hj_mixed_a a,hj_mixed_b b where a.c=b.c and b.s=a.s and a.n=b.n and a.x=b.x";
+  CHECK(f.plan(mixed, true).find("key_count=3") != std::string::npos);
+  f.count(mixed, 1, true); // FLOAT remains a residual, other types form the joint key.
+  f.table("hj_parts_a", "x char(16), y char(16)"); f.table("hj_parts_b", "x char(16), y char(16)");
+  f.sql("insert into hj_parts_a values ('a','bc'),('ab','c'),('a|b','c'),('a','b|c'),('','')");
+  f.sql("insert into hj_parts_b values ('a','bc'),('ab','c'),('a|b','c'),('a','b|c'),('','')");
+  f.count("select count(*) from hj_parts_a a,hj_parts_b b where a.x=b.x and a.y=b.y", 5, true);
+
+  // At the second step, joint-key columns come from two DIFFERENT left tables.
+  f.table("hj_class_c", "c int, s int");
+  f.sql("insert into hj_class_c values (1,1),(1,2),(2,1),(8,8),(9,9),(10,10)");
+  const std::string multi = "select count(*) from hj_class_a a,hj_class_b b,hj_class_c c where a.c=b.c and a.s=b.s and a.c=c.c and b.s=c.s";
+  const std::string plan = f.plan(multi, true);
+  const size_t first = plan.find("key_count=2");
+  CHECK(first != std::string::npos && plan.find("key_count=2", first + 1) != std::string::npos);
+  f.count(multi, 6, true);
+  // First-level candidate count must be higher when ONLY c is supplied as a key.
+  f.count("select count(*)" + from + "where a.c=b.c", 11, true);
+  CHECK(f.engine->last_profile().find("candidates=11 build_rows=4 probe_rows=5") != std::string::npos);
+}
+
 int main() {
   Fixture f;
-  basic_and_predicates(f); types_and_multitable(f); indexed_path_and_budget(f);
+  basic_and_predicates(f); types_and_multitable(f); indexed_path_and_budget(f); composite_keys(f);
   CHECK(f.db->close() == RC::SUCCESS);
-  std::puts("HashJoin SQL v5.2: all tests passed (plans, profiles, predicates, types, multitable, indexes, budget)");
+  std::puts("HashJoin SQL v5.2/v6: all tests passed (single/composite keys, plans, profiles, predicates, types, multitable, indexes, budget)");
   return 0;
 }

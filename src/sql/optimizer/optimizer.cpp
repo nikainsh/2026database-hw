@@ -600,7 +600,7 @@ bool choose_join_index_lookup(TableGetOperator &get, const std::vector<Expressio
 // counts and their Cartesian product. Do not promise that this is process RSS.
 // Unknown/oversized inputs keep the streaming nested-loop plan instead of
 // selecting a hash table already known to exceed its estimated-storage budget.
-bool hash_build_fits(const std::vector<TableGetOperator *> &gets, const ColumnExpression &key)
+bool hash_build_fits(const std::vector<TableGetOperator *> &gets, const std::vector<HashJoinKey> &keys)
 {
   const size_t budget = HashJoinOperator::DEFAULT_MAX_BUILD_BYTES;
   size_t bytes = sizeof(Tuple) + sizeof(std::string) + sizeof(std::vector<Tuple>) + 4 * sizeof(void *);
@@ -609,7 +609,7 @@ bool hash_build_fits(const std::vector<TableGetOperator *> &gets, const ColumnEx
     bytes += amount;
     return true;
   };
-  bool found_key = false;
+  size_t found_keys = 0;
   size_t rows = 1;
   for (TableGetOperator *get : gets) {
     const auto &columns = get->table()->table_meta().columns();
@@ -617,9 +617,11 @@ bool hash_build_fits(const std::vector<TableGetOperator *> &gets, const ColumnEx
       const auto &column = columns[i];
       if (!charge(sizeof(Value) + sizeof(ColumnRef))) return false;
       if (column.type() == AttrType::CHARS && !charge(static_cast<size_t>(column.data_len()))) return false;
-      if (get->table_index() == key.table_index() && static_cast<int>(i) == key.column_index()) {
-        if (!charge(static_cast<size_t>(column.data_len()))) return false;
-        found_key = true;
+      for (const auto &key : keys) {
+        if (key.left == ColumnRef(get->table_index(), static_cast<int>(i))) {
+          if (!charge(HashJoinOperator::KEY_PART_OVERHEAD) || !charge(static_cast<size_t>(column.data_len()))) return false;
+          ++found_keys;
+        }
       }
     }
     int64_t count = 0;
@@ -631,18 +633,12 @@ bool hash_build_fits(const std::vector<TableGetOperator *> &gets, const ColumnEx
       rows *= static_cast<size_t>(count);
     }
   }
-  return found_key && bytes <= budget && rows <= budget / bytes;
+  return found_keys == keys.size() && bytes <= budget && rows <= budget / bytes;
 }
-
-struct HashJoinKeys
-{
-  const ColumnExpression *left = nullptr;
-  const ColumnExpression *right = nullptr;
-};
 
 bool choose_hash_join(const std::vector<Expression *> &conditions, const std::set<int> &left_tables,
                       const std::set<int> &right_tables, const std::vector<TableGetOperator *> &build_gets,
-                      HashJoinKeys &keys)
+                      std::vector<HashJoinKey> &keys)
 {
   // These are mandatory AND conjuncts moved to Join by predicate_pushdown.
   // Never descend into OR to extract an equality that is not mandatory.
@@ -658,12 +654,13 @@ bool choose_hash_join(const std::vector<Expression *> &conditions, const std::se
     const AttrType type = left->result_type();
     if (type != right->result_type() ||
         (type != AttrType::INT && type != AttrType::BIGINT && type != AttrType::CHARS)) continue;
-    if (!hash_build_fits(build_gets, *left)) continue;
-    keys.left = left;
-    keys.right = right;
-    return true;
+    const HashJoinKey key{left->ref(), right->ref(), type};
+    const bool duplicate = std::any_of(keys.begin(), keys.end(), [&](const HashJoinKey &existing) {
+      return existing.left == key.left && existing.right == key.right && existing.type == key.type;
+    });
+    if (!duplicate) keys.push_back(key);
   }
-  return false;
+  return !keys.empty() && hash_build_fits(build_gets, keys);
 }
 
 /// select count(*) from 单表 且没有任何过滤条件：答案就是堆文件头里的记录数，
@@ -964,10 +961,9 @@ RC PhysicalPlanGenerator::create(LogicalOperator &logical, std::unique_ptr<Physi
 
         // Preserve the existing indexed lookup. A parameterized probe scan
         // cannot be opened once by Hash Join: its key depends on each outer row.
-        HashJoinKeys hash_keys;
+        std::vector<HashJoinKey> hash_keys;
         if (!index_lookup && choose_hash_join(step_conditions, outer_tables, child_tables, build_gets, hash_keys)) {
-          auto hash = std::make_unique<HashJoinOperator>(hash_keys.left->ref(), hash_keys.right->ref(),
-                                                         hash_keys.left->result_type());
+          auto hash = std::make_unique<HashJoinOperator>(std::move(hash_keys));
           hash->add_child(std::move(left));
           hash->add_child(std::move(right));
           // Keep ALL step conjuncts, including other equality keys. Borrow the
