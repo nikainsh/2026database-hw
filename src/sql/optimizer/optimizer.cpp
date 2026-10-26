@@ -11,6 +11,7 @@
 #include "common/log.h"
 #include "sql/operator/aggregate_operators.h"
 #include "sql/operator/dml_operators.h"
+#include "sql/operator/hash_join_operator.h"
 #include "sql/operator/relation_operators.h"
 #include "sql/operator/scan_operators.h"
 
@@ -595,6 +596,76 @@ bool choose_join_index_lookup(TableGetOperator &get, const std::vector<Expressio
   return false;
 }
 
+// A conservative bound for the retained build tuples, using unfiltered table
+// counts and their Cartesian product. Do not promise that this is process RSS.
+// Unknown/oversized inputs keep the streaming nested-loop plan instead of
+// selecting a hash table already known to exceed its estimated-storage budget.
+bool hash_build_fits(const std::vector<TableGetOperator *> &gets, const ColumnExpression &key)
+{
+  const size_t budget = HashJoinOperator::DEFAULT_MAX_BUILD_BYTES;
+  size_t bytes = sizeof(Tuple) + sizeof(std::string) + sizeof(std::vector<Tuple>) + 4 * sizeof(void *);
+  auto charge = [&](size_t amount) {
+    if (bytes > budget || amount > budget - bytes) return false;
+    bytes += amount;
+    return true;
+  };
+  bool found_key = false;
+  size_t rows = 1;
+  for (TableGetOperator *get : gets) {
+    const auto &columns = get->table()->table_meta().columns();
+    for (size_t i = 0; i < columns.size(); ++i) {
+      const auto &column = columns[i];
+      if (!charge(sizeof(Value) + sizeof(ColumnRef))) return false;
+      if (column.type() == AttrType::CHARS && !charge(static_cast<size_t>(column.data_len()))) return false;
+      if (get->table_index() == key.table_index() && static_cast<int>(i) == key.column_index()) {
+        if (!charge(static_cast<size_t>(column.data_len()))) return false;
+        found_key = true;
+      }
+    }
+    int64_t count = 0;
+    if (OB_FAIL(get->table()->record_count(count)) || count < 0) return false;
+    if (get->always_false()) count = 0;
+    if (rows == 0 || count == 0) rows = 0;
+    else {
+      if (static_cast<uint64_t>(count) > budget / rows) return false;
+      rows *= static_cast<size_t>(count);
+    }
+  }
+  return found_key && bytes <= budget && rows <= budget / bytes;
+}
+
+struct HashJoinKeys
+{
+  const ColumnExpression *left = nullptr;
+  const ColumnExpression *right = nullptr;
+};
+
+bool choose_hash_join(const std::vector<Expression *> &conditions, const std::set<int> &left_tables,
+                      const std::set<int> &right_tables, const std::vector<TableGetOperator *> &build_gets,
+                      HashJoinKeys &keys)
+{
+  // These are mandatory AND conjuncts moved to Join by predicate_pushdown.
+  // Never descend into OR to extract an equality that is not mandatory.
+  for (Expression *condition : conditions) {
+    if (condition->expr_type() != ExprType::COMPARISON) continue;
+    const auto *comparison = static_cast<const ComparisonExpression *>(condition);
+    if (comparison->comp() != CompOp::EQUAL_TO || comparison->left() == nullptr || comparison->right() == nullptr ||
+        comparison->left()->expr_type() != ExprType::COLUMN || comparison->right()->expr_type() != ExprType::COLUMN) continue;
+    const auto *left = static_cast<const ColumnExpression *>(comparison->left());
+    const auto *right = static_cast<const ColumnExpression *>(comparison->right());
+    if (left_tables.count(right->table_index()) && right_tables.count(left->table_index())) std::swap(left, right);
+    if (!left_tables.count(left->table_index()) || !right_tables.count(right->table_index())) continue;
+    const AttrType type = left->result_type();
+    if (type != right->result_type() ||
+        (type != AttrType::INT && type != AttrType::BIGINT && type != AttrType::CHARS)) continue;
+    if (!hash_build_fits(build_gets, *left)) continue;
+    keys.left = left;
+    keys.right = right;
+    return true;
+  }
+  return false;
+}
+
 /// select count(*) from 单表 且没有任何过滤条件：答案就是堆文件头里的记录数，
 /// 不必真的去扫一遍（InnoDB 的 count(*) 短路是同一条思路）
 bool is_plain_count_star(AggregateOperator &aggregate, TableGetOperator *&get)
@@ -842,6 +913,8 @@ RC PhysicalPlanGenerator::create(LogicalOperator &logical, std::unique_ptr<Physi
       }
       std::set<int> outer_tables = tables_of(*join.children()[0]);
       std::vector<Expression *> unattached = join.on_conditions();
+      std::vector<TableGetOperator *> build_gets;
+      collect_table_gets(*join.children()[0], build_gets);
 
       for (size_t i = 1; i < join.children().size(); ++i) {
         LogicalOperator &child       = *join.children()[i];
@@ -875,6 +948,7 @@ RC PhysicalPlanGenerator::create(LogicalOperator &logical, std::unique_ptr<Physi
         /// 索引嵌套循环连接：内表本来要全扫，但连接列上有索引且更便宜，
         /// 就改成「按外层这一行的键值查索引」。连接条件仍会在 NLJ 里复核，
         /// 所以这一步只影响快慢，不影响结果。
+        bool index_lookup = false;
         if (child.kind() == LogicalOperatorKind::TABLE_GET &&
             right->kind() == PhysicalOperatorKind::TABLE_SCAN) {
           TableGetOperator &get       = *static_cast<TableGetOperator *>(&child);
@@ -884,17 +958,34 @@ RC PhysicalPlanGenerator::create(LogicalOperator &logical, std::unique_ptr<Physi
                                                             IndexScanRange(), get.table_index());
             scan->set_join_key(lookup.outer_column);
             right = std::move(scan);
+            index_lookup = true;
           }
         }
 
-        auto nested = std::make_unique<NestedLoopJoinOperator>(std::move(step_conditions));
-        nested->add_child(std::move(left));
-        nested->add_child(std::move(right));
-        left = std::move(nested);
+        // Preserve the existing indexed lookup. A parameterized probe scan
+        // cannot be opened once by Hash Join: its key depends on each outer row.
+        HashJoinKeys hash_keys;
+        if (!index_lookup && choose_hash_join(step_conditions, outer_tables, child_tables, build_gets, hash_keys)) {
+          auto hash = std::make_unique<HashJoinOperator>(hash_keys.left->ref(), hash_keys.right->ref(),
+                                                         hash_keys.left->result_type());
+          hash->add_child(std::move(left));
+          hash->add_child(std::move(right));
+          // Keep ALL step conjuncts, including other equality keys. Borrow the
+          // Stmt-owned expressions; do not create a short-lived expression tree.
+          auto filter = std::make_unique<FilterPhysicalOperator>(std::move(step_conditions));
+          filter->add_child(std::move(hash));
+          left = std::move(filter);
+        } else {
+          auto nested = std::make_unique<NestedLoopJoinOperator>(std::move(step_conditions));
+          nested->add_child(std::move(left));
+          nested->add_child(std::move(right));
+          left = std::move(nested);
+        }
 
         for (int table_index : child_tables) {
           outer_tables.insert(table_index);
         }
+        collect_table_gets(child, build_gets);
       }
 
       /// 兜底：挂不上任何一层的连接条件（理论上不该发生）继续在顶层过滤，宁可慢不能漏

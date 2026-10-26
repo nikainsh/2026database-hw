@@ -16,8 +16,9 @@
 class HashJoinOperator : public PhysicalOperator
 {
 public:
+  static constexpr size_t DEFAULT_MAX_BUILD_BYTES = 8 * 1024 * 1024;
   HashJoinOperator(ColumnRef left_key, ColumnRef right_key, AttrType key_type,
-                   Expression *residual = nullptr, size_t max_build_bytes = 8 * 1024 * 1024)
+                   Expression *residual = nullptr, size_t max_build_bytes = DEFAULT_MAX_BUILD_BYTES)
       : left_key_(left_key), right_key_(right_key), key_type_(key_type),
         residual_(residual), max_build_bytes_(max_build_bytes) {}
 
