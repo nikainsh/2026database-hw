@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -261,6 +262,71 @@ static void check_model(BplusTree &tree, Model &model)
 // 用例
 // ---------------------------------------------------------------------------
 
+// Keep this regression active under NDEBUG: data operations must not disappear
+// together with assert(). The existing randomized tests remain unchanged below.
+static void separator_require(bool condition, const char *message)
+{
+  if (!condition) {
+    std::fprintf(stderr, "FAIL deterministic separator regression: %s\n", message);
+    std::exit(1);
+  }
+}
+
+static void test_delete_leaf_min_without_underflow()
+{
+  const std::string path = "./_test_index/separator_min.idx";
+  separator_require(OB_SUCC(path_mkdir_recursive("./_test_index")), "create test directory");
+  for (const auto &file : {path, path + ".wal"}) {
+    if (file_exist(file)) separator_require(OB_SUCC(path_remove_file(file)), "remove previous fixture");
+  }
+  DiskBufferPoolManager bpm(24);
+  separator_require(OB_SUCC(bpm.create_file(path)), "create index file");
+  DiskBufferPool *pool = nullptr;
+  separator_require(OB_SUCC(bpm.open_file(path, ReadWriteMode::READ_WRITE, &pool)), "open index file");
+  BplusTree tree;
+  separator_require(OB_SUCC(tree.open(pool, AttrType::INT, sizeof(int32_t), true, true)), "open tree");
+
+  PageHandle page;
+  separator_require(OB_SUCC(pool->get_page_read(INDEX_HEADER_PAGE, page)), "read tree header");
+  IndexFileHeader header;
+  std::memcpy(&header, page.const_data(), sizeof(header));
+  page.reset();
+  separator_require(header.order >= 4 && header.min_keys > 0, "usable node capacity");
+  // About 1.5 pages of sorted unique keys cause one leaf split. The right
+  // leaf has spare occupancy, so deleting its minimum does not cause underflow.
+  const int inserted = header.order + header.min_keys;
+  for (int i = 0; i < inserted; ++i) {
+    const auto key = int_key(i);
+    separator_require(OB_SUCC(tree.insert_entry(key.data(), make_rid(i))), "insert sorted keys");
+  }
+  separator_require(OB_SUCC(tree.validate()), "tree valid before boundary deletion");
+  separator_require(OB_SUCC(pool->get_page_read(INDEX_HEADER_PAGE, page)), "refresh header after split");
+  std::memcpy(&header, page.const_data(), sizeof(header));
+  page.reset();
+  separator_require(OB_SUCC(pool->get_page_read(header.first_leaf_page, page)), "read first leaf");
+  IndexNodeHeader leaf;
+  std::memcpy(&leaf, page.const_data(), sizeof(leaf));
+  const PageNum right = leaf.next_leaf;
+  page.reset();
+  separator_require(leaf.is_leaf && right != INVALID_PAGE_NUM, "leaf split produced a right sibling");
+  separator_require(OB_SUCC(pool->get_page_read(right, page)), "read right leaf");
+  std::memcpy(&leaf, page.const_data(), sizeof(leaf));
+  separator_require(leaf.is_leaf && leaf.num_key > header.min_keys, "right leaf stays sufficiently full after one deletion");
+  int32_t boundary;
+  std::memcpy(&boundary, page.const_data() + sizeof(IndexNodeHeader), sizeof(boundary));
+  page.reset(); // Release page latch before calling delete_entry().
+
+  std::fprintf(stderr, "separator regression: inserted=%d delete_min=%d right_count=%d min_keys=%d\n",
+               inserted, boundary, leaf.num_key, header.min_keys);
+  const auto key = int_key(boundary);
+  separator_require(OB_SUCC(tree.delete_entry(key.data(), make_rid(boundary))), "delete right-leaf minimum");
+  separator_require(tree.entry_count() == inserted - 1, "entry count after deletion");
+  const RC rc = tree.validate();
+  if (OB_FAIL(rc)) std::fprintf(stderr, "separator regression: validate after non-underflow deletion returned %s\n", strrc(rc));
+  separator_require(OB_SUCC(rc), "parent separator must match the new right-subtree minimum");
+  separator_require(OB_SUCC(bpm.close()), "close fixture");
+}
+
 static void test_int_keys(bool unique, const char *path)
 {
   path_mkdir_recursive("./_test_index");
@@ -453,6 +519,7 @@ static void test_bigint_keys()
 
 int main()
 {
+  test_delete_leaf_min_without_underflow();
   test_int_keys(true, "./_test_index/u.idx");
   test_int_keys(false, "./_test_index/n.idx");
   test_char_keys();
