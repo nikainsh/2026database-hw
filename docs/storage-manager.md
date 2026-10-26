@@ -16,7 +16,7 @@ sql 算子 / QueryEngine
  HeapRecordManager  BplusTreeIndex     TableMeta
  (record/)           (index/)          (table/)
         │               │
-        └──── DiskBufferPool v2（src/storage/buffer）──── 文件 / WAL
+        └──── DiskBufferPool v3（src/storage/buffer）──── 文件 / WAL
 ```
 
 ---
@@ -26,21 +26,21 @@ sql 算子 / QueryEngine
 | 文件 | 行数 | 内容 |
 | --- | ---: | --- |
 | `record/record.h` | 89 | `RID = (page_num, slot_num)`；`Record` 可引用页内内存，也可 `copy_data()` 持有副本 |
-| `record/slotted_page.h` | 67 | 页头 `SlottedPageHeader`、槽位读写、`init_slotted_page`、`find_free_slot` |
-| `record/record_manager.h` | 66 | 表头 `RecordFileHeader` 与 `HeapRecordManager` 接口 |
-| `record/record_manager.cpp` | 305 | 插入（找页 → 找空槽 → 写记录 → 回填 RID）、删除、原地更新、按 RID 读、行数统计 |
-| `record/record_scanner.h` | 33 | 全表扫描游标 |
-| `record/record_scanner.cpp` | 81 | 按 (页, 槽) 顺序遍历，一次只 pin 一页，跨 4 页做顺序预取 |
-| `index/bplus_tree.h` | 208 | 树头 `IndexFileHeader`、节点头 `IndexNodeHeader`、`BplusTree` / `BplusTreeScanner` |
-| `index/bplus_tree.cpp` | 1481 | 查找、插入分裂、删除借位/合并/根收缩、范围游标、键编码比较、树级 latch、`validate()` |
-| `index/index.h` | 72 | 索引抽象接口 `Index`、`BplusTreeIndex`、文件路径辅助函数 |
-| `index/index.cpp` | 100 | 从整条记录里切出被索引列当定长键，包装 `BplusTree` |
-| `table/table_meta.h` | 95 | `IndexMeta` / `ColumnMeta` / `TableMeta` 定义 |
-| `table/table_meta.cpp` | 291 | 由列定义算偏移与 `record_size`、`make_record` / `get_field_value`、小端序列化 |
-| `table/table.h` | 61 | `Table` 接口 |
-| `table/table.cpp` | 212 | 组合堆文件与索引：写路径同步索引、唯一冲突回滚、索引列变化时先删后插 |
+| `record/slotted_page.h` | 101 | 页头 `SlottedPageHeader`、槽位读写、`init_slotted_page`、`find_free_slot` |
+| `record/record_manager.h` | 83 | 表头 `RecordFileHeader` 与 `HeapRecordManager` 接口 |
+| `record/record_manager.cpp` | 412 | 插入（找页 → 找空槽 → 写记录 → 回填 RID）、删除、原地更新、按 RID 读、行数统计 |
+| `record/record_scanner.h` | 39 | 全表扫描游标 |
+| `record/record_scanner.cpp` | 88 | 按 (页, 槽) 顺序遍历，一次只 pin 一页，跨 4 页做顺序预取 |
+| `index/bplus_tree.h` | 214 | 树头 `IndexFileHeader`、节点头 `IndexNodeHeader`、`BplusTree` / `BplusTreeScanner` |
+| `index/bplus_tree.cpp` | 1602 | 查找、插入分裂、删除借位/合并/根收缩、范围游标、键编码比较、树级 latch、`validate()` |
+| `index/index.h` | 84 | 索引抽象接口 `Index`、`BplusTreeIndex`、文件路径辅助函数 |
+| `index/index.cpp` | 135 | 从整条记录里切出被索引列当定长键，包装 `BplusTree` |
+| `table/table_meta.h` | 122 | `IndexMeta` / `ColumnMeta` / `TableMeta` 定义 |
+| `table/table_meta.cpp` | 399 | 由列定义算偏移与 `record_size`、`make_record` / `get_field_value`、小端序列化 |
+| `table/table.h` | 76 | `Table` 接口 |
+| `table/table.cpp` | 463 | 组合堆文件与索引：写路径同步索引、唯一冲突回滚、索引列变化时先删后插 |
 
-合计 14 个文件 / 约 3160 行。
+合计 14 个文件 / 约 3900 行。
 
 ---
 
@@ -49,7 +49,7 @@ sql 算子 / QueryEngine
 所有文件按 **8KB 一页**（`BP_PAGE_SIZE`）组织，页号从 0 开始：
 
 ```
-页 0    缓冲池文件头（v2 里还带 CRC、free list、WAL 元信息）
+页 0    缓冲池文件头（v3 起还带 CRC、free list、WAL 元信息）
 页 1    表头 RecordFileHeader  /  索引头 IndexFileHeader
 页 2+   数据页（slotted page）  /  B+Tree 节点页
 ```
@@ -63,11 +63,15 @@ sql 算子 / QueryEngine
 |                        ...            <- 未使用空间                 |
 |  ... | slot 2 | slot 1 | slot 0 |    <- 槽位目录从页尾向前生长       |
 +------------------------------------------------------------------+
-slot[i] 固定在 BP_PAGE_SIZE - 4*(i+1)，存记录字节偏移，-1 表示已删除
+slot[i] 固定在 BP_PAGE_SIZE - 4*(i+1)：>= 页头大小 表示记录体偏移；
+                                      < 0 表示已删除，绝对值就是记录体原偏移（旧格式的 -1 没有偏移）
 ```
 
 - 记录**定长**：`TableMeta::record_size()` 累加各列 `data_len()`，所以 `update` 原地覆写、**RID 不变**。
-- 删除只把槽位置 -1，空槽被后续插入复用；一页全空时在下次插入失败时重置成空页。
+- 删除把槽位写成 `-offset`（负值 = 已删除，绝对值保留记录体位置），后续插入可以**原地复用**那块
+  记录体空间，不必做页内整理；一页全空时在下次插入放不下的时候重置成空页。
+  旧版本写入的 `-1` 仍被识别为「已删除」，只是没有偏移可复用（插入会重新分配记录体）——
+  **文件格式兼容**，不需要升级 magic。
 - 表头页 `RecordFileHeader`：magic `'MDB1'`、`record_size`、有效行数、`last_insert_page`（让连续插入摊还 O(1)）。
   打开时校验 `record_size`，不一致返回 `RC::SCHEMA_FIELD_TYPE_MISMATCH`。
 
@@ -103,9 +107,9 @@ slot[i] 固定在 BP_PAGE_SIZE - 4*(i+1)，存记录字节偏移，-1 表示已�
 
 ---
 
-## 4. 与缓冲管理器 v2 的约定（重要）
+## 4. 与缓冲管理器 v3 的约定（重要）
 
-v2 把「取页」拆成了带页锁的两种：
+从 v2 起把「取页」拆成了带页锁的两种，v3 又把 frame 所有权收归全局 `FrameManager`（**API 不变**，见 `docs/buffer-v3.md`）：
 
 ```cpp
 pool->get_page_read(page, handle);    // 共享页锁，只能读 const_data()
@@ -179,7 +183,7 @@ pool->get_page_write(page, handle);   // 排他页锁，改 value() 后必须 ma
 ## 8. 已知限制
 
 - **索引**：只支持单列索引、单列主键；没有多列索引，也没有 `drop index`（建了删不掉）。
-- **非唯一索引**里同一个键跨多个叶子时，删除只定位并删掉一条 —— 不影响查询正确性，但可能暂时低于最小填充度。
+- **非唯一索引**里同一个键跨多个叶子时，`locate_entry` 会从 `find_leaf` 落点沿 `prev_leaf` 回退，把散在左侧叶子里的同键条目也找出来（此前只删一条的简化已经修掉）。
 - **记录**：定长，没有变长记录、没有页内压缩整理（`varchar(n)` 也是按定长存）。
 - **统计信息**：只有「条目数 / NDV / 最小最大键」三类，没有直方图/分桶；NDV 对非唯一索引是近似值。
 - **事务**：没有表级事务、没有 undo/redo；`Table::insert_record` 的「回滚」只是把刚插入的记录删掉。
