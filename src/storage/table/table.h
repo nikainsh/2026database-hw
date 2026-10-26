@@ -54,6 +54,8 @@ public:
 
 private:
   RC open_indexes(bool create);
+  /// 建索引失败时回滚：删元数据、关缓冲池里的文件、删磁盘文件与页级 WAL
+  RC rollback_index_creation(const std::string &index_name);
 
 private:
   TableMeta                            meta_;

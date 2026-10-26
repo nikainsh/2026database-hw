@@ -10,6 +10,12 @@
 /// 第 0 页归缓冲池（文件头），第 1 页归记录管理器（表头），数据页从第 2 页开始
 static constexpr PageNum RECORD_META_PAGE = 1;
 
+/// 一条记录最多能有多大：页头 + 至少要给它留一个槽位，剩下的空间才放得下记录本身。
+/// 超过这个值的 record_size 在 open() 阶段直接拒绝 —— 否则空页也装不下，
+/// insert_record 会不断分配新页、无限扩文件（每轮 8KB）而永远插不进去。
+static constexpr int32_t RECORD_MAX_SIZE =
+    BP_PAGE_SIZE - static_cast<int32_t>(sizeof(SlottedPageHeader)) - static_cast<int32_t>(sizeof(int32_t));
+
 static constexpr int32_t RECORD_FILE_MAGIC = 0x4D444231;  /// 'MDB1'
 
 /// 表头页（第 1 页）里保存的信息

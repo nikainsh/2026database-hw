@@ -13,6 +13,11 @@ RC HeapRecordManager::open(DiskBufferPool *buffer_pool, int record_size, bool cr
   if (buffer_pool == nullptr || record_size <= 0) {
     return RC::INVALID_ARGUMENT;
   }
+  /// 一页放不下一条记录时必须在打开阶段就拒绝：否则 insert 会一直找页、一直分配新页
+  if (record_size > RECORD_MAX_SIZE) {
+    LOG_ERROR("record size too large to fit in a page. record_size=%d, max=%d", record_size, RECORD_MAX_SIZE);
+    return RC::INVALID_ARGUMENT;
+  }
 
   buffer_pool_ = buffer_pool;
   file_name_   = buffer_pool->file_name();
@@ -98,6 +103,12 @@ RC HeapRecordManager::insert_record(Record &record)
   }
   if (record.len() != record_size_) {
     LOG_ERROR("invalid record size. file=%s, len=%d, expect=%d", file_name_.c_str(), record.len(), record_size_);
+    return RC::INVALID_ARGUMENT;
+  }
+  /// 防御：open 已拦截，但如果 record_size_ 被改坏，这里必须直接失败而不是无限找页
+  if (record_size_ > RECORD_MAX_SIZE) {
+    LOG_ERROR("record size too large to fit in a page. file=%s, record_size=%d, max=%d",
+              file_name_.c_str(), record_size_, RECORD_MAX_SIZE);
     return RC::INVALID_ARGUMENT;
   }
 
