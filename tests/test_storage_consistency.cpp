@@ -435,6 +435,96 @@ static void test_corrupted_page_header()
   assert(OB_SUCC(bpm.close()));
 }
 
+// ---------------------------------------------------------------------------
+// 7) 槽位复用要真正回收记录体空间：挖空的页还能原位插回去，文件不该变长
+// ---------------------------------------------------------------------------
+static void test_slot_reuse_reclaims_space()
+{
+  const int         kRecordSize = 16;
+  const std::string heap_path   = path_join(kDbDir, "reuse.heap");
+
+  DiskBufferPoolManager bpm(32);
+  assert(OB_SUCC(bpm.create_file(heap_path)));
+
+  DiskBufferPool *pool = nullptr;
+  assert(OB_SUCC(bpm.open_file(heap_path, ReadWriteMode::READ_WRITE, &pool)));
+
+  HeapRecordManager manager;
+  assert(OB_SUCC(manager.open(pool, kRecordSize, true)));
+
+  /// 一页能放多少条：页头 16 字节 + 每条 (16 字节记录 + 4 字节槽位)
+  const int kPerPage = (BP_PAGE_SIZE - static_cast<int>(sizeof(SlottedPageHeader))) /
+                       (kRecordSize + static_cast<int>(sizeof(int32_t)));
+  assert(kPerPage == 408);
+
+  std::vector<RID> rids;
+  for (int i = 0; i < kPerPage * 3; ++i) {
+    char    data[kRecordSize] = {0};
+    int32_t id                = i;
+    memcpy(data, &id, sizeof(id));
+
+    Record record;
+    assert(OB_SUCC(record.copy_data(data, kRecordSize)));
+    assert(OB_SUCC(manager.insert_record(record)));
+    rids.push_back(record.rid());
+  }
+
+  const PageNum pages_before = pool->page_count();
+  assert(pages_before == 5);  /// 页 0（缓冲池）+ 页 1（表头）+ 3 个数据页
+
+  /// 把第 2 页挖出 100 个空槽（记录体空间还占着）
+  int deleted = 0;
+  for (const RID &rid : rids) {
+    if (rid.page_num != RECORD_FIRST_DATA_PAGE || deleted >= 100) {
+      continue;
+    }
+    assert(OB_SUCC(manager.delete_record(rid)));
+    ++deleted;
+  }
+  assert(deleted == 100);
+
+  /// 再插 100 条：必须原地复用第 2 页的空槽，而不是去扩新页
+  for (int i = 0; i < 100; ++i) {
+    char    data[kRecordSize] = {0};
+    int32_t id                = 100000 + i;
+    memcpy(data, &id, sizeof(id));
+
+    Record record;
+    assert(OB_SUCC(record.copy_data(data, kRecordSize)));
+    assert(OB_SUCC(manager.insert_record(record)));
+    assert(record.rid().page_num == RECORD_FIRST_DATA_PAGE);
+  }
+
+  assert(pool->page_count() == pages_before);
+
+  int64_t count = 0;
+  assert(OB_SUCC(manager.get_record_count(count)));
+  assert(count == static_cast<int64_t>(kPerPage) * 3);
+
+  assert(OB_SUCC(bpm.close()));
+}
+
+// ---------------------------------------------------------------------------
+// 8) 取字段时越界要报错：记录缓冲区比列范围还短时不能照读
+// ---------------------------------------------------------------------------
+static void test_field_value_bounds()
+{
+  const TableMeta meta = make_user_meta();
+
+  char   short_data[8] = {0};
+  Record short_record;
+  assert(OB_SUCC(short_record.copy_data(short_data, 8)));
+
+  Value value;
+  /// score 列在 offset 20 之后，8 字节的缓冲区装不下
+  assert(meta.get_field_value(short_record, *meta.column("score"), value) == RC::INVALID_ARGUMENT);
+  assert(meta.field_data(short_record, *meta.column("score")) == nullptr);
+
+  /// id 列落在前 8 个字节里，仍然可以正常读
+  assert(OB_SUCC(meta.get_field_value(short_record, *meta.column("id"), value)));
+  assert(value.get_int32() == 0);
+}
+
 static void setup_database(Db **db)
 {
   std::error_code ec;
@@ -471,6 +561,8 @@ int main()
   test_record_size_limit();
   test_concurrent_insert();
   test_corrupted_page_header();
+  test_slot_reuse_reclaims_space();
+  test_field_value_bounds();
 
   assert(OB_SUCC(db->close()));
   delete db;
