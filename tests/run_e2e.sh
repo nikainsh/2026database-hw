@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# minidb 端到端自测：跑示例脚本、验证持久化、验证优化器选择了索引、验证错误路径。
+# database 端到端自测：跑示例脚本、验证持久化、验证优化器选择了索引、验证错误路径。
 #
 #   bash tests/run_e2e.sh
 set -u
 cd "$(dirname "$0")/.."
 
-BIN=${BIN:-./build/bin/minidb}
+BIN=${BIN:-./build/bin/database}
 [ -x "${BIN}.exe" ] && BIN="${BIN}.exe"
 if [ ! -x "$BIN" ]; then
   echo "找不到可执行文件 $BIN，请先构建：bash build.sh"

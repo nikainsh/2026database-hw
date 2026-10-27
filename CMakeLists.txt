@@ -1,6 +1,6 @@
-# minidb 的 CMake 工程（等价于 Makefile / build.sh，供习惯 cmake 的环境使用）
+# database 的 CMake 工程（等价于 Makefile / build.sh，供习惯 cmake 的环境使用）
 cmake_minimum_required(VERSION 3.10)
-project(minidb CXX)
+project(database CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,7 +15,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 file(GLOB_RECURSE MINIDB_LIB_SRC CONFIGURE_DEPENDS src/*.cpp)
 list(FILTER MINIDB_LIB_SRC EXCLUDE REGEX "main\\.cpp$")
 
-add_executable(minidb src/shell/main.cpp ${MINIDB_LIB_SRC})
+add_executable(database src/shell/main.cpp ${MINIDB_LIB_SRC})
 
 if(MINGW OR WIN32)
   add_compile_definitions(__USE_MINGW_ANSI_STDIO=1)

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# minidb 构建脚本：不依赖 cmake，Git Bash / Linux / macOS 都能直接用
+# database 构建脚本：不依赖 cmake，Git Bash / Linux / macOS 都能直接用
 #
-#   ./build.sh            编译命令行程序 -> build/bin/minidb
+#   ./build.sh            编译命令行程序 -> build/bin/database
 #   ./build.sh test       编译主程序 + 全部自测并运行
 #   ./build.sh clean      清理 build/ 与测试数据
 #   ./build.sh rebuild    重新编译全部
@@ -82,8 +82,8 @@ build_lib() {
 
 link_main() {
   if [ -f src/shell/main.cpp ]; then
-    echo "==> linking ${BINDIR}/minidb$EXE"
-    $CXX $CXXFLAGS src/shell/main.cpp "${LIB_OBJS[@]}" -o "${BINDIR}/minidb$EXE" $LDFLAGS \
+    echo "==> linking ${BINDIR}/database$EXE"
+    $CXX $CXXFLAGS src/shell/main.cpp "${LIB_OBJS[@]}" -o "${BINDIR}/database$EXE" $LDFLAGS \
       || { echo "!! 链接失败。若报 dangerous relocation / ld 崩溃，请先执行：bash build.sh clean"; return 1; }
   else
     echo "==> no src/shell/main.cpp yet, only compiled library objects"

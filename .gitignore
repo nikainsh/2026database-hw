@@ -20,3 +20,4 @@ _test_index_stats/
 _test_crash/
 _test_repro/
 _test_repro_int/
+__pycache__/

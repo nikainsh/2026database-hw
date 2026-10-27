@@ -8,7 +8,7 @@
 #
 # 可用环境变量覆盖：
 #   BASE_BIN  改前版本可执行文件，默认 /mnt/e/database/build/bin/minidb
-#   OPT_BIN   改后版本可执行文件，默认 ./build/bin/minidb
+#   OPT_BIN   改后版本可执行文件，默认 ./build/bin/database
 #   WORK      工作目录，默认 /tmp/minidb_compare
 #
 # 输出两部分：
@@ -21,7 +21,7 @@ ROWS=${1:-20000}
 REPEAT=${2:-5}
 HERE=$(cd "$(dirname "$0")" && pwd)
 BASE_BIN=${BASE_BIN:-/mnt/e/database/build/bin/minidb}
-OPT_BIN=${OPT_BIN:-./build/bin/minidb}
+OPT_BIN=${OPT_BIN:-./build/bin/database}
 WORK=${WORK:-/tmp/minidb_compare}
 
 if [ "$(uname -s)" != "Linux" ]; then
@@ -77,7 +77,7 @@ run_one() {  # run_one <bin> <datadir> <标签>
   for i in $(seq "$REPEAT"); do cat "$HERE/compare_timing.sql"; done >"$WORK/$tag.rep.sql"
   "$bin" --data "$data" --db t -f "$WORK/$tag.rep.sql" >"$WORK/$tag.raw" 2>&1
   tr -d '\000\r' <"$WORK/$tag.raw" | awk -v nq="$NQ" '
-    /^minidb> / { blk++; cells=""; nhdr=0; next }
+    /^(minidb|database)> / { blk++; cells=""; nhdr=0; next }
     /^ *[0-9]+ rows/ { next }
     /\([0-9]+ us\)/ { t=$0; gsub(/[^0-9]/,"",t); print blk, cells, t; next }
     /\|/ {

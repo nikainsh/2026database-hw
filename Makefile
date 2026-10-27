@@ -1,6 +1,6 @@
-# minidb 的 Makefile：Linux / macOS / Windows(mingw32-make) 通用
+# database 的 Makefile：Linux / macOS / Windows(mingw32-make) 通用
 #
-#   make            构建 build/bin/minidb
+#   make            构建 build/bin/database
 #   make test       构建并运行全部自测（单元测试 + 端到端）
 #   make clean      清理构建产物
 #
@@ -51,7 +51,7 @@ MAIN_OBJ  := $(OBJDIR)/src/shell/main.o
 TEST_SRCS := $(wildcard tests/test_*.cpp)
 TEST_BINS := $(patsubst tests/%.cpp,$(BINDIR)/%$(EXE),$(TEST_SRCS))
 
-MAIN_BIN  := $(BINDIR)/minidb$(EXE)
+MAIN_BIN  := $(BINDIR)/database$(EXE)
 
 .PHONY: all test unit e2e clean rebuild
 
