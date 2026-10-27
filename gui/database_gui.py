@@ -136,12 +136,11 @@ class DatabaseApp:
         return 'break'
 
     def explain(self):
-        sql = self.sql().rstrip(';').strip()
-        # Let the SQL parser reject multiple statements; never execute trailing DML here.
-        if not sql.lower().startswith('select '):
-            messagebox.showinfo('EXPLAIN', '请选择一条以 SELECT 开头的查询，再查看计划。')
-            return
-        self.submit('explain ' + sql, 'plan', single=True)
+        sql = self.sql()
+        # The backend parser handles whitespace/comments and rejects non-SELECT SQL.
+        # Single-statement mode prevents trailing statements from being executed.
+        if sql:
+            self.submit('explain ' + sql, 'plan', single=True)
 
     def refresh(self):
         self.submit('show tables;', 'tables')
@@ -178,8 +177,10 @@ class DatabaseApp:
             for button in (self.run_button, self.plan_button, self.refresh_button):
                 button.configure(state='normal')
             if error:
+                self.clear_results()
                 self.status.set('执行失败')
                 self.history.append(error)
+                self.history = self.history[-100:]
                 self.replace(self.messages, '\n\n'.join(self.history))
                 self.notebook.select(self.messages.master)
             else:
@@ -187,6 +188,7 @@ class DatabaseApp:
         self.root.after(80, self.poll)
 
     def accept(self, kind, results):
+        self.clear_results()
         self.results = results
         for item in results:
             self.history.append(f"{item['sql'].strip()}\n[{item['code']}] {item['message']} | "
@@ -203,12 +205,22 @@ class DatabaseApp:
             self.tables.delete(0, 'end')
             for row in results[-1]['rows']:
                 self.tables.insert('end', row[0])
-        if kind == 'plan':
-            self.notebook.select(self.plan.master)
-        elif results[-1]['code'] != 'SUCCESS':
+        if results[-1]['code'] != 'SUCCESS':
             self.notebook.select(self.messages.master)
+        elif kind == 'plan':
+            self.notebook.select(self.plan.master)
         else:
             self.notebook.select(self.result_page)
+
+    def clear_results(self):
+        self.results = []
+        self.current = None
+        self.selector['values'] = ()
+        self.selector.set('')
+        self.grid.delete(*self.grid.get_children())
+        self.grid['columns'] = ()
+        self.replace(self.plan, '')
+        self.replace(self.statistics, '')
 
     def show_result(self, index):
         if index < 0 or index >= len(self.results):

@@ -38,6 +38,12 @@ std::string strip_sql_comments(const std::string &sql)
     }
     if (in_string) {
       out.push_back(c);
+      // Match next_token(): backslash followed by a quote is a literal quote.
+      if (c == '\\' && i + 1 < sql.size() && sql[i + 1] == '\'') {
+        out.push_back(sql[i + 1]);
+        i += 2;
+        continue;
+      }
       if (c == '\'' && i + 1 < sql.size() && sql[i + 1] == '\'') {  /// '' 是转义的单引号
         out.push_back('\'');
         i += 2;
@@ -62,6 +68,7 @@ std::string strip_sql_comments(const std::string &sql)
       continue;
     }
     if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+      out.push_back(' ');  // A comment separates tokens, e.g. select/*...*/id.
       in_block = true;
       i += 2;
       continue;

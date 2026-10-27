@@ -14,6 +14,7 @@
 #include "common/rc.h"
 #include "common/string_util.h"
 #include "sql/query_engine.h"
+#include "sql/parser/lexer.h"
 #include "storage/db/db.h"
 #include "shell/json_output.h"
 
@@ -72,6 +73,10 @@ SplitResult split_partial(const std::string &text)
     }
     if (in_string) {
       current.push_back(c);
+      if (c == '\\' && i + 1 < text.size() && text[i + 1] == '\'') {
+        current.push_back(text[++i]);
+        continue;
+      }
       if (c == '\'') {
         if (i + 1 < text.size() && text[i + 1] == '\'') {
           current.push_back('\'');
@@ -99,7 +104,7 @@ SplitResult split_partial(const std::string &text)
       continue;
     }
     if (c == ';') {
-      if (!trim(current).empty()) {
+      if (!trim(strip_sql_comments(current)).empty()) {
         result.complete.push_back(current);
       }
       current.clear();
@@ -117,7 +122,7 @@ SplitResult split_partial(const std::string &text)
 std::vector<std::string> split_statements(const std::string &text)
 {
   SplitResult parts = split_partial(text);
-  if (!parts.pending.empty()) {
+  if (!trim(strip_sql_comments(parts.pending)).empty()) {
     parts.complete.push_back(parts.pending);
   }
   return parts.complete;
@@ -293,7 +298,7 @@ void usage()
 bool run_statement(QueryEngine &engine, const std::string &sql, ResultWriter &writer, bool &want_exit)
 {
   want_exit = false;
-  if (trim(sql).empty()) {
+  if (trim(strip_sql_comments(sql)).empty()) {
     return true;
   }
 
@@ -405,7 +410,7 @@ int main(int argc, char **argv)
       std::printf("database> %s\n", trim(statement).c_str());
       bool want_exit = false;
       if (!run_statement(engine, statement, out, want_exit)) {
-        ok = !want_exit;  /// exit 不算失败
+        ok = want_exit;  /// 正常 exit 返回成功，SQL 错误返回失败。
         break;
       }
     }

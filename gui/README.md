@@ -37,7 +37,7 @@ python gui/database_gui.py
 python gui/test_gui.py
 ```
 
-测试使用 `build` 下自动清理的临时库，覆盖真实 SQL 执行、联合键计划与统计、中文/特殊字符、空结果、SQL 错误中止、NUMERIC_OVERFLOW、结果截断计数、EXPLAIN 单语句保护及 Tk 结果切换。
+测试使用 `build` 下自动清理的临时库，覆盖真实 SQL 执行、联合键计划与统计、中文/特殊字符、注释与转义、CLI 脚本退出码、空结果、SQL 错误中止、NUMERIC_OVERFLOW、结果截断计数、带注释的多行 EXPLAIN、单语句保护、Tk 结果切换及失败后的旧结果清理。
 
 ## 文件分工
 
