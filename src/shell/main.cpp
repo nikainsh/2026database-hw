@@ -1,4 +1,4 @@
-/* minidb - 用户界面（命令行 REPL），对应 miniob 的 obclient + observer 交互部分 */
+/* database - 用户界面（命令行 REPL），对应 miniob 的 obclient + observer 交互部分 */
 
 #include <chrono>
 #include <cstdio>
@@ -15,10 +15,11 @@
 #include "common/string_util.h"
 #include "sql/query_engine.h"
 #include "storage/db/db.h"
+#include "shell/json_output.h"
 
 namespace {
 
-const char *kHelpText = R"(minidb supports:
+const char *kHelpText = R"(database supports:
   create table t (id int, name char(16), age int, score float, primary key(id))
   drop table [if exists] t
   create [unique] index i on t (col)
@@ -234,6 +235,8 @@ struct Options
   bool        profile    = false;
   bool        show_rows  = true;
   bool        print_help = false;
+  bool        json       = false;
+  bool        json_single = false;
 };
 
 Options parse_args(int argc, char **argv)
@@ -249,6 +252,11 @@ Options parse_args(int argc, char **argv)
       options.sql_file = argv[++i];
     } else if (arg == "-e" && i + 1 < argc) {
       options.execute_sql = argv[++i];
+    } else if (arg == "--json") {
+      options.json = true;
+    } else if (arg == "--json-single") {
+      options.json = true;
+      options.json_single = true;
     } else if (arg == "--verbose") {
       options.verbose = true;
     } else if (arg == "--profile") {
@@ -268,7 +276,7 @@ Options parse_args(int argc, char **argv)
 void usage()
 {
   std::printf(
-      "usage: minidb [options]\n"
+      "usage: database [options]\n"
       "  --db <name>     database name (default: testdb)\n"
       "  --data <dir>    data directory (default: ./data)\n"
       "  -f <file>       run a SQL script and exit\n"
@@ -276,6 +284,8 @@ void usage()
       "  --verbose       print debug logs\n"
       "  --profile       show per-operator execution statistics\n"
       "  --quiet         do not print result rows\n"
+      "  --json          read SQL script from stdin, emit JSON (GUI bridge)\n"
+      "  --json-single   JSON bridge accepting exactly one statement\n"
       "  -h, --help      show this help\n");
 }
 
@@ -336,7 +346,7 @@ int main(int argc, char **argv)
       std::fprintf(stderr, "failed to create db '%s': %s\n", options.db_name.c_str(), strrc(rc));
       return 1;
     }
-    std::printf("created a new database '%s' in %s\n", options.db_name.c_str(), options.data_dir.c_str());
+    if (!options.json) std::printf("created a new database '%s' in %s\n", options.db_name.c_str(), options.data_dir.c_str());
   } else if (OB_FAIL(rc)) {
     std::fprintf(stderr, "failed to open db '%s': %s\n", options.db_name.c_str(), strrc(rc));
     return 1;
@@ -350,7 +360,34 @@ int main(int argc, char **argv)
 
   bool ok = true;
 
-  if (!options.execute_sql.empty()) {
+  if (options.json) {
+    // stdin avoids Windows command-line encoding and length limits for SQL scripts.
+    std::stringstream buffer;
+    buffer << std::cin.rdbuf();
+    const auto statements = split_statements(buffer.str());
+    bool first = true;
+    std::cout << "[";
+    if (options.json_single && statements.size() != 1) {
+      JsonOutput json;
+      SqlResult result;
+      result.message = "Select exactly one statement.";
+      json.emit(std::cout, buffer.str(), RC::INVALID_ARGUMENT, result, "");
+      ok = false;
+    }
+    for (const auto &statement : statements) {
+      if (!ok) break;
+      if (trim(statement).empty()) continue;
+      JsonOutput json;
+      SqlResult result;
+      RC statement_rc = engine.execute(statement, json, result);
+      if (!first) std::cout << ',';
+      first = false;
+      json.emit(std::cout, statement, statement_rc, result, engine.last_profile());
+      if (OB_FAIL(statement_rc)) { ok = false; break; }
+      if (result.want_exit) break;
+    }
+    std::cout << "]\n";
+  } else if (!options.execute_sql.empty()) {
     bool want_exit = false;
     ok             = run_statement(engine, options.execute_sql, out, want_exit);
   } else if (!options.sql_file.empty()) {
@@ -365,7 +402,7 @@ int main(int argc, char **argv)
     buffer << in.rdbuf();
 
     for (const std::string &statement : split_statements(buffer.str())) {
-      std::printf("minidb> %s\n", trim(statement).c_str());
+      std::printf("database> %s\n", trim(statement).c_str());
       bool want_exit = false;
       if (!run_statement(engine, statement, out, want_exit)) {
         ok = !want_exit;  /// exit 不算失败
@@ -373,11 +410,11 @@ int main(int argc, char **argv)
       }
     }
   } else {
-    std::printf("minidb [%s] -- type 'help' for the supported syntax, 'exit' to quit\n",
+    std::printf("database [%s] -- type 'help' for the supported syntax, 'exit' to quit\n",
                 options.db_name.c_str());
     std::string line, buffer_text;
     while (true) {
-      std::printf(buffer_text.empty() ? "minidb> " : "    ...> ");
+      std::printf(buffer_text.empty() ? "database> " : "    ...> ");
       std::fflush(stdout);
       if (!std::getline(std::cin, line)) {
         break;  /// EOF
