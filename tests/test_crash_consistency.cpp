@@ -6,6 +6,23 @@
 #include <filesystem>
 #include <string>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifdef FILE_CREATE
+#undef FILE_CREATE
+#endif
+#ifdef FILE_OPEN
+#undef FILE_OPEN
+#endif
+#else
+#include <cerrno>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #include "common/file_util.h"
 #include "storage/buffer/disk_buffer_pool.h"
 
@@ -110,19 +127,56 @@ static int child_main(const std::string &case_name, const std::string &dir)
   return 0;
 }
 
-static std::string quote(const std::string &value) { return "\"" + value + "\""; }
-
 static int run_child(const std::string &self, const std::string &case_name, const std::string &point,
                      const std::string &dir)
 {
-  std::string command;
 #ifdef _WIN32
-  command = "set MINIDB_CRASH_POINT=" + point + "&& " + quote(self) + " --child " + case_name + " " +
-            quote(dir);
+  (void)self;
+  // argv[0] and std::system use narrow paths on Windows. Read the real Unicode
+  // executable path and launch it directly, without cmd.exe or shell quoting.
+  std::wstring executable(32768, L'\0');
+  const DWORD length = GetModuleFileNameW(nullptr, &executable[0], static_cast<DWORD>(executable.size()));
+  assert(length > 0 && length < executable.size());
+  executable.resize(length);
+  // Case names and test directories are fixed ASCII strings owned by this test.
+  std::wstring command = L"\"" + executable + L"\" --child " +
+      std::wstring(case_name.begin(), case_name.end()) + L" \"" + std::wstring(dir.begin(), dir.end()) + L"\"";
+  wchar_t previous[32768];
+  const DWORD previous_length = GetEnvironmentVariableW(L"MINIDB_CRASH_POINT", previous, 32768);
+  assert(previous_length < 32768);
+  const std::wstring wide_point(point.begin(), point.end());
+  assert(SetEnvironmentVariableW(L"MINIDB_CRASH_POINT", wide_point.c_str()));
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  const BOOL started = CreateProcessW(executable.c_str(), &command[0], nullptr, nullptr, FALSE,
+                                     CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+  const DWORD launch_error = started ? 0 : GetLastError();
+  assert(SetEnvironmentVariableW(L"MINIDB_CRASH_POINT", previous_length ? previous : nullptr));
+  if (!started) {
+    std::fprintf(stderr, "crash test: CreateProcessW failed, error=%lu\n", static_cast<unsigned long>(launch_error));
+    return -1;
+  }
+  assert(WaitForSingleObject(process.hProcess, INFINITE) == WAIT_OBJECT_0);
+  DWORD status = 0;
+  assert(GetExitCodeProcess(process.hProcess, &status));
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  return static_cast<int>(status);
 #else
-  command = "MINIDB_CRASH_POINT=" + point + " " + quote(self) + " --child " + case_name + " " + quote(dir);
+  const pid_t pid = fork();
+  assert(pid >= 0);
+  if (pid == 0) {
+    if (setenv("MINIDB_CRASH_POINT", point.c_str(), 1) != 0) std::_Exit(126);
+    execl(self.c_str(), self.c_str(), "--child", case_name.c_str(), dir.c_str(), static_cast<char *>(nullptr));
+    std::_Exit(127);
+  }
+  int status = 0;
+  pid_t waited;
+  do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+  assert(waited == pid);
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 #endif
-  return std::system(command.c_str());
 }
 
 static void verify_write(const std::string &dir)
@@ -177,7 +231,8 @@ static void run_case(const std::string &self, const std::string &case_name, cons
   }
 
   const int status = run_child(self, case_name, point, dir);
-  assert(status != 0);
+  // Only the injection hook's exit code proves this crash point was reached.
+  assert(status == 99);
 
   if (case_name == "write" || case_name == "checkpoint") {
     verify_write(dir);
@@ -198,7 +253,11 @@ int main(int argc, char **argv)
   remove_dir(kBase);
   assert(OB_SUCC(path_mkdir_recursive(kBase)));
 
+#ifdef _WIN32
+  const std::string self;  // run_child obtains its path with GetModuleFileNameW.
+#else
   const std::string self = std::filesystem::absolute(argv[0]).string();
+#endif
 
   run_case(self, "write", "before_single_page_write");
   run_case(self, "write", "after_single_page_write");
